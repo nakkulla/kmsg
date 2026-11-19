@@ -100,8 +100,14 @@ kmsg update
 kmsg status
 kmsg chats
 kmsg read "채팅방 이름" --limit 20
+kmsg read "채팅방 이름" --since 24h
 kmsg send "채팅방 이름" "안녕하세요" --dry-run
 ```
+
+`kmsg chats --json`은 방마다 안 읽은 메시지 수(`unread_count`, 배지가 없으면
+`null`)를 함께 줍니다. `kmsg read --since`는 개수 대신 시각을 기준으로, 그
+시각 이후의 메시지를 예전 기록까지 불러와 모두 읽습니다. 시각은 ISO 8601
+(`2026-11-18T07:00:00+09:00`)이나 상대값(`90m`, `24h`, `2d`)으로 줍니다.
 
 `kmsg status`는 손쉬운 사용 권한을 요청하고, 필요하면 KakaoTalk을 실행한
 뒤 로그인 상태를 확인합니다. 마지막 명령은 dry run이므로 실제 메시지를

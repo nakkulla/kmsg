@@ -74,8 +74,15 @@ Direct-download and source-build instructions are in [USAGE.md](USAGE.md#install
 kmsg status
 kmsg chats
 kmsg read "Chat name" --limit 20
+kmsg read "Chat name" --since 24h
 kmsg send "Chat name" "Hello" --dry-run
 ```
+
+`kmsg chats --json` includes each chat's unread badge count as `unread_count`
+(`null` when there is no badge). `kmsg read --since` reads every message at or
+after a time instead of the latest N, loading older history as needed. Pass an
+ISO 8601 time (`2026-11-18T07:00:00+09:00`) or a relative span (`90m`, `24h`,
+`2d`).
 
 `kmsg status` requests Accessibility permission, launches KakaoTalk when
 needed, and checks authentication. The final command is a dry run and does not

@@ -190,6 +190,12 @@ kmsg chats [options]
 Each result includes a local synthetic `chat_id`. The registry is refreshed by
 running `kmsg chats` and stored at `~/.kmsg/chat-registry.json`.
 
+Each result also includes the chat list's unread badge as `unread_count`
+(`null` when the row shows no badge). A capped badge such as `999+` becomes
+`unread_count: 999` with `unread_count_capped: true`. Text output appends the
+count after the title, for example `[1] 홍길동 (3)`. The count is read from the
+chat list before any chat is opened, so a later `read` does not change it.
+
 ### `read`
 
 ```bash
@@ -202,7 +208,10 @@ A chat name and `--chat-id` are mutually exclusive.
 | Option | Description |
 |---|---|
 | `--chat-id ID` | Resolve a synthetic ID produced by `kmsg chats`. |
-| `-l N`, `--limit N` | Maximum messages to return. Default: `20`. |
+| `-l N`, `--limit N` | Maximum messages to return. Default: `20`. With `--since`, a safety cap. Default: `2000`. |
+| `--since TIME` | Return every message at or after `TIME` instead of the latest `N`. Accepts ISO 8601 (`2026-11-18T07:00:00+09:00`; local time when no offset is given) or a relative span (`90m`, `24h`, `2d`). |
+| `--max-pages N` | With `--since`, load at most `N` pages (about 50 rows each) of older history. Default: `40`. |
+| `--timeout-sec N` | With `--since`, overall time budget in seconds. When it runs out, the newest messages read so far are returned with `truncated: true`. Default: `180`. |
 | `--debug` | Show compact raw parsing information in text output. |
 | `--trace-ax` | Print AX traversal and retry details. |
 | `-k`, `--keep-window` | Keep a chat window opened by the command. |
@@ -216,6 +225,17 @@ The name form supports partial matching. For repeated automation, use a
 
 `--background-safe` is suitable for automation that must not disturb foreground
 work, but it fails unless the matching chat window is already exposed.
+
+#### Reading since a time
+
+`--since` scrolls the chat transcript to the top repeatedly so KakaoTalk loads
+older messages (about 50 rows per page), until the oldest loaded message is
+older than `TIME`, the conversation start is reached, `--max-pages` is hit, or
+half of `--timeout-sec` is used. It then scrolls back to the bottom and reads
+from the newest message backwards, stopping at the first message older than
+`TIME`. Message times have minute precision, so `TIME` is compared at the start
+of its minute. Combined with `--background-safe`, `--since` does not scroll and
+reads only the rows already loaded in the window.
 
 #### If `--background-safe` is missing
 
@@ -362,9 +382,16 @@ The server exposes:
 
 | Tool | Purpose |
 |---|---|
-| `kmsg_read` | Read by `chat` or `chat_id`, with limit, layout, recovery, background-safe, window, and trace controls. |
+| `kmsg_read` | Read by `chat` or `chat_id`, with limit, `since`, `timeout_sec`, layout, recovery, background-safe, window, and trace controls. |
 | `kmsg_send` | Send a text message by chat name. |
 | `kmsg_send_image` | Send a local image by chat name. |
+
+`kmsg_read` limits: without `since`, `limit` is clamped to `1..100` (default
+`20`) and the read process times out after 8 seconds (15 with deep recovery).
+With `since`, `limit` is a safety cap clamped to `1..2000` (default `2000`), and
+`timeout_sec` (default `180`, range `10..600`) sets the process time limit. The
+result `meta` then also carries `since`, `oldest_reached`, `truncated`, and
+`pages_loaded`.
 
 For send tools, `confirm=false` or an omitted `confirm` sends immediately.
 `confirm=true` does not send; it returns `CONFIRMATION_REQUIRED` so a supervisor
@@ -408,7 +435,9 @@ kmsg chats --json
     {
       "title": "홍길동",
       "chat_id": "chat_7f42c5e1d9ab",
-      "last_message": "곧 도착해요"
+      "last_message": "곧 도착해요",
+      "unread_count": 3,
+      "unread_count_capped": false
     }
   ]
 }
@@ -443,6 +472,31 @@ kmsg read "홍길동" --limit 20 --json
 
 `date` and `time_raw` may be absent when KakaoTalk does not expose the
 corresponding metadata.
+
+With `--since`, the document adds four fields:
+
+```bash
+kmsg read --chat-id "chat_7f42c5e1d9ab" --since 2026-11-18T07:00:00+09:00 --json
+```
+
+```json
+{
+  "chat": "홍길동",
+  "fetched_at": "2026-11-19T01:23:45.678Z",
+  "count": 42,
+  "messages": ["..."],
+  "since": "2026-11-18T07:00:00+09:00",
+  "oldest_reached": false,
+  "truncated": false,
+  "pages_loaded": 1
+}
+```
+
+`oldest_reached` is `true` when paging reached the start of the conversation.
+`truncated` is `true` when the read stopped at `--max-pages`, `--timeout-sec`,
+or `--limit` before covering `since`, or when `--background-safe` prevented
+loading older history; the returned messages are then the newest part of the
+range. An empty range returns `count: 0`.
 
 ### Watch
 
