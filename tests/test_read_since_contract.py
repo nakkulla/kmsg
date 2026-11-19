@@ -90,6 +90,15 @@ class ReadSinceContractTests(unittest.TestCase):
         self.assertIn("if let edge = labelled.max()", reader)
         self.assertIn("ownLabel=", reader)
 
+    def test_time_label_accepts_receipt_count_prefix(self) -> None:
+        helpers = TRANSCRIPT_TIME.read_text(encoding="utf-8")
+
+        # KakaoTalk renders the newest labels as "1\n오후 1:17" (receipt count, then time).
+        self.assertIn("1\\n오후 1:17", helpers)
+        self.assertIn(".split(whereSeparator: \\.isNewline)", helpers)
+        self.assertIn('case 2 where lines[0].range(of: #"^\\d{1,4}$"#, options: .regularExpression) != nil:', helpers)
+        self.assertIn("return candidate", helpers)
+
     def test_since_messages_take_date_and_time_from_own_labels(self) -> None:
         reader = TRANSCRIPT_READER.read_text(encoding="utf-8")
 

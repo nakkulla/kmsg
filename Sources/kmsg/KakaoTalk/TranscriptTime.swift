@@ -49,18 +49,33 @@ enum TranscriptTime {
         return nil
     }
 
-    /// The text of a message's own time label ("오전 10:34", "오후 1:32", "13:05").
-    /// The whole label must be a time, so bodies or quotes that mention one are ignored.
+    /// The time of a message's own time label ("오전 10:34", "오후 1:32", "13:05").
+    /// KakaoTalk may prefix the label with a read-receipt count line ("1\n오후 1:17");
+    /// that line is dropped and only the time is returned. Any other mixed text
+    /// (bodies or quotes that mention a time, a bare count like "1") is rejected.
     static func timeLabel(_ text: String?) -> String? {
         guard let trimmed = text?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+            return nil
+        }
+        let lines = trimmed
+            .split(whereSeparator: \.isNewline)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        let candidate: String
+        switch lines.count {
+        case 1:
+            candidate = lines[0]
+        case 2 where lines[0].range(of: #"^\d{1,4}$"#, options: .regularExpression) != nil:
+            candidate = lines[1]
+        default:
             return nil
         }
         let patterns = [
             #"^(오전|오후)\s*([1-9]|1[0-2]):[0-5][0-9]$"#,
             #"^([01]?[0-9]|2[0-3]):[0-5][0-9]$"#,
         ]
-        for pattern in patterns where trimmed.range(of: pattern, options: .regularExpression) != nil {
-            return trimmed
+        for pattern in patterns where candidate.range(of: pattern, options: .regularExpression) != nil {
+            return candidate
         }
         return nil
     }
