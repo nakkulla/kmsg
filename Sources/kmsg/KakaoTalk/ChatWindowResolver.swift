@@ -311,6 +311,11 @@ struct ChatWindowResolver {
         }
 
         _ = runner.setTextWithVerification("", on: searchField, label: "search field clear", attempts: 1)
+        if !originalSearchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            // Clearing a filtered list rebuilds it too; let that settle before the snapshot.
+            Thread.sleep(forTimeInterval: 0.4)
+        }
+        let listBeforeInput = searchListSnapshot(in: rootWindow)
 
         let searchInputReady =
             runner.setTextWithVerification(query, on: searchField, label: "search field input", attempts: 1) ||
@@ -321,14 +326,22 @@ struct ChatWindowResolver {
             throw KakaoTalkError.actionFailed("[\(ChatWindowFailureCode.inputNotReflected.rawValue)] Search keyword was not entered")
         }
 
+        // The chat list keeps showing its unfiltered rows for a few hundred ms after the
+        // query is typed. A row matched there is replaced by the search results, so wait
+        // for the list to be rebuilt before scanning.
+        waitForSearchListRebuild(since: listBeforeInput, in: rootWindow)
+
         let matchingCandidates = waitForMatchingSearchResults(query: query, rootWindow: rootWindow)
         guard let matchingResult = pickBestSearchResult(from: matchingCandidates) else {
             runner.pressEscape()
             throw KakaoTalkError.elementNotFound("[\(ChatWindowFailureCode.searchMiss.rawValue)] No search result found for '\(query)'")
         }
 
+        let windowsBeforeOpen = kakao.windows
         let openTriggered = triggerSearchResultOpen(
             matchingResult,
+            query: query,
+            rootWindow: rootWindow,
             searchField: searchField
         ) {
             resolveOpenedChatWindowFast(query: query) != nil
@@ -339,9 +352,15 @@ struct ChatWindowResolver {
         }
 
         if let window = waitForOpenedChatWindow(query: query, fallbackWindow: fallbackWindow) {
-            return window
+            let isNewWindow = !windowsBeforeOpen.contains { areSameAXElement($0, window) }
+            let titleMatches = scoreQueryMatch(query: query, candidateText: window.title ?? "") > 0
+            if !isNewWindow || titleMatches {
+                return window
+            }
+            runner.log("search: opened window title does not match '\(query)'; treating as wrong chat")
         }
 
+        closeWindowsOpened(after: windowsBeforeOpen)
         throw KakaoTalkError.windowNotFound("[\(ChatWindowFailureCode.windowNotReady.rawValue)] Chat window for '\(query)' did not open")
     }
 
@@ -997,6 +1016,8 @@ struct ChatWindowResolver {
 
     private func triggerSearchResultOpen(
         _ candidate: SearchCandidate,
+        query: String,
+        rootWindow: UIElement,
         searchField: UIElement,
         opened: () -> Bool
     ) -> Bool {
@@ -1012,16 +1033,18 @@ struct ChatWindowResolver {
 
         // Search-result rows only expose AXShowDefaultUI/AXShowAlternateUI and ignore
         // keyboard Enter, so a real double-click is the reliable way to open the chat.
-        // Use the point captured at scan time; the AX handle is often stale by now.
-        if let clickPoint = candidate.clickPoint ?? clickableCenter(of: result) {
-            kakao.activate()
-            runner.mouseDoubleClick(at: clickPoint, label: "search result")
-            didTriggerAction = true
-            if runner.waitUntil(label: "search open confirm (double-click)", timeout: 0.6, pollInterval: 0.05, evaluateAfterTimeout: false, condition: opened) {
-                return true
-            }
-        } else {
-            runner.log("search: double-click skipped (no clickable frame)")
+        // The click is posted only when the row under the point right now matches the
+        // query; a point that no longer holds that row (stale layout, ad banner, another
+        // app on top) is never clicked, and the keyboard fallbacks below are skipped too.
+        kakao.activate()
+        guard let clickPoint = verifiedSearchResultClickPoint(candidate, query: query, rootWindow: rootWindow) else {
+            runner.log("search: double-click skipped (no matching row under the click point)")
+            return didTriggerAction
+        }
+        runner.mouseDoubleClick(at: clickPoint, label: "search result")
+        didTriggerAction = true
+        if runner.waitUntil(label: "search open confirm (double-click)", timeout: 0.6, pollInterval: 0.05, evaluateAfterTimeout: false, condition: opened) {
+            return true
         }
         runner.log("search: direct activate miss; skipping heavy neighbor scan for speed")
 
@@ -1068,6 +1091,115 @@ struct ChatWindowResolver {
         }
 
         return didTriggerAction
+    }
+
+    // MARK: - Search list transition and click verification
+
+    private struct SearchListSnapshot {
+        let firstRow: UIElement?
+        let tableFrame: CGRect?
+    }
+
+    private func searchListSnapshot(in rootWindow: UIElement) -> SearchListSnapshot {
+        let firstRow = rootWindow.findAll(role: kAXRowRole, limit: 1, maxNodes: 600).first
+        return SearchListSnapshot(firstRow: firstRow, tableFrame: firstRow?.parent?.frame)
+    }
+
+    /// KakaoTalk replaces the list's rows when it switches to search results: the old
+    /// row handles die and the table frame changes. Returns once either is observed.
+    @discardableResult
+    private func waitForSearchListRebuild(since before: SearchListSnapshot, in rootWindow: UIElement) -> Bool {
+        guard let oldFirstRow = before.firstRow else {
+            runner.log("search: no list rows before input; skipping rebuild wait")
+            return false
+        }
+        let rebuilt = runner.waitUntil(label: "search list rebuild", timeout: 1.5, pollInterval: 0.04) {
+            if oldFirstRow.role == nil {
+                return true
+            }
+            return searchListSnapshot(in: rootWindow).tableFrame != before.tableFrame
+        }
+        if !rebuilt {
+            runner.log("search: list rebuild not observed; relying on click-point verification")
+        }
+        return rebuilt
+    }
+
+    private func verifiedSearchResultClickPoint(
+        _ candidate: SearchCandidate,
+        query: String,
+        rootWindow: UIElement
+    ) -> CGPoint? {
+        var point = clickableCenter(of: candidate.element) ?? candidate.clickPoint
+        for attempt in 1...3 {
+            if let point, isMatchingRowUnderPoint(point, query: query) {
+                return point
+            }
+            runner.log("search: click point rejected on attempt \(attempt)")
+            Thread.sleep(forTimeInterval: 0.12)
+            let rescanned = findMatchingSearchResults(query: query, rootWindow: rootWindow, profile: Self.clickVerifyScanProfile)
+            point = rescanned.max { scoreSearchResult($0) < scoreSearchResult($1) }?.clickPoint
+        }
+        if let point, isMatchingRowUnderPoint(point, query: query) {
+            return point
+        }
+        return nil
+    }
+
+    private static let clickVerifyScanProfile = SearchScanProfile(
+        label: "click-verify",
+        timeout: 0.34,
+        pollInterval: 0.04,
+        rowLimit: 24,
+        cellLimit: 24,
+        supplementalLimit: 0,
+        candidateNodeBudget: 320,
+        textLimit: 6,
+        textNodeBudget: 80,
+        includeSupplementalRoles: false,
+        includeApplicationRoot: false
+    )
+
+    /// Hit-tests the point: KakaoTalk must own the topmost element there, and that
+    /// element must sit in a row or cell whose text matches the query.
+    private func isMatchingRowUnderPoint(_ point: CGPoint, query: String) -> Bool {
+        var kakaoPid: pid_t = 0
+        AXUIElementGetPid(kakao.applicationElement.axElement, &kakaoPid)
+        if let topmost = try? UIElement.systemWide().element(at: point) {
+            var topmostPid: pid_t = 0
+            AXUIElementGetPid(topmost.axElement, &topmostPid)
+            if topmostPid != kakaoPid {
+                runner.log("search: click point is covered by another app (pid \(topmostPid))")
+                return false
+            }
+        }
+
+        guard let hit = try? kakao.applicationElement.element(at: point) else {
+            runner.log("search: hit-test failed at (\(Int(point.x)),\(Int(point.y)))")
+            return false
+        }
+        var cursor: UIElement? = hit
+        var hops = 0
+        while let current = cursor, hops < 8 {
+            let role = current.role
+            if role == kAXRowRole || role == kAXCellRole,
+               bestQueryMatch(query: query, in: current, textLimit: 6, textNodeBudget: 80).score > 0
+            {
+                return true
+            }
+            cursor = current.parent
+            hops += 1
+        }
+        runner.log("search: element under click point is '\(hit.role ?? "unknown")', not a matching row")
+        return false
+    }
+
+    /// Closes chat windows that appeared after `before` was captured (a wrong chat opened by kmsg).
+    private func closeWindowsOpened(after before: [UIElement]) {
+        for window in kakao.windows where !before.contains(where: { areSameAXElement($0, window) }) {
+            runner.log("search: closing unexpected window opened by this lookup")
+            closeWindow(window)
+        }
     }
 
     private func tryActivateSearchResult(_ element: UIElement, label: String) -> Bool {
