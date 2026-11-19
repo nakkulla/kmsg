@@ -49,6 +49,22 @@ enum TranscriptTime {
         return nil
     }
 
+    /// The text of a message's own time label ("오전 10:34", "오후 1:32", "13:05").
+    /// The whole label must be a time, so bodies or quotes that mention one are ignored.
+    static func timeLabel(_ text: String?) -> String? {
+        guard let trimmed = text?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else {
+            return nil
+        }
+        let patterns = [
+            #"^(오전|오후)\s*([1-9]|1[0-2]):[0-5][0-9]$"#,
+            #"^([01]?[0-9]|2[0-3]):[0-5][0-9]$"#,
+        ]
+        for pattern in patterns where trimmed.range(of: pattern, options: .regularExpression) != nil {
+            return trimmed
+        }
+        return nil
+    }
+
     /// Start of the local day for a "YYYY-MM-DD" message date.
     static func localDay(_ date: String?, calendar: Calendar = .current) -> Date? {
         guard let date else { return nil }

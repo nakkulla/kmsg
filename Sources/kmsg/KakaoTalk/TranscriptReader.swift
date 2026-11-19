@@ -415,6 +415,8 @@ struct KakaoTalkTranscriptReader {
         var buttonTitlesBuffer: [String] = []
         var imageFrames: [CGRect] = []
         var rowHelpDate: String?
+        var labelDate: String?
+        var labelTime: String?
         var linkElementCount = 0
         var urlTokenCount = 0
 
@@ -470,10 +472,18 @@ struct KakaoTalkTranscriptReader {
             }
 
             for staticText in staticTexts {
-                if rowHelpDate == nil, let help = staticText.helpText, let parsed = Self.parseHelpDate(help) {
+                let rawValue = staticText.stringValue
+                let ownTime = TranscriptTime.timeLabel(rawValue)
+                let help = (rowHelpDate == nil || (labelTime == nil && ownTime != nil)) ? staticText.helpText : nil
+                if rowHelpDate == nil, let help, let parsed = Self.parseHelpDate(help) {
                     rowHelpDate = parsed
                 }
-                let normalized = normalizeBodyText(staticText.stringValue)
+                // The message's own time label: its text is a bare time and its AXHelp is the date.
+                if labelTime == nil, let ownTime, let help, let parsed = Self.parseHelpDate(help) {
+                    labelTime = ownTime
+                    labelDate = parsed
+                }
+                let normalized = normalizeBodyText(rawValue)
                 guard !normalized.isEmpty else { continue }
                 metadataTokensBuffer.append(contentsOf: metadataTokens(from: normalized))
                 urlTokenCount += countURLTokens(in: normalized)
@@ -561,7 +571,9 @@ struct KakaoTalkTranscriptReader {
             linkCount: max(linkElementCount, urlTokenCount),
             attachmentCount: attachmentCount,
             isSystemLikeRow: systemLikeRow,
-            axHelpDate: rowHelpDate
+            axHelpDate: rowHelpDate,
+            labelDate: labelDate,
+            labelTime: labelTime
         )
     }
 
@@ -1256,42 +1268,65 @@ extension KakaoTalkTranscriptReader {
 
         // Analyze newest first and stop once a row is provably older than `since`,
         // then a few more rows so the forward pass has an author anchor.
+        // Only rows with their own time label can cross `since`, and a crossing needs
+        // two consecutive time-labelled rows older than `since`, so one out-of-order
+        // label (e.g. a quoted or forwarded message) cannot cut the range short.
         let inputMinY = context.inputElement.frame?.minY
         var reversedAnalyses: [RowAnalysis] = []
         var crossedSince = false
+        var pendingCross: Int?
+        var crossReversedIndex: Int?
         var contextRows = 0
         var deadlineHit = false
+        var rowsExhausted = true
         for row in rows.reversed() {
             if crossedSince, contextRows >= Self.anchorContextRows {
+                rowsExhausted = false
                 break
             }
             if Date() >= deadline {
                 deadlineHit = true
+                rowsExhausted = false
                 break
             }
             if let inputMinY, let rowFrame = frameCache.frame(of: row), rowFrame.maxY > inputMinY + 20 {
                 continue
             }
             let analysis = analyzeRow(row, transcriptRoot: context.transcriptRoot, referenceDate: referenceDate, frameCache: frameCache)
+            let reversedIndex = reversedAnalyses.count
             reversedAnalyses.append(analysis)
+            let older = analysis.labelTimestamp.map { $0 < sinceMinute }
+
             if crossedSince {
                 contextRows += 1
-                if analysis.explicitAuthor != nil {
-                    break
+            } else if let older {
+                if !older {
+                    pendingCross = nil
+                } else if let pending = pendingCross {
+                    crossedSince = true
+                    crossReversedIndex = pending
+                } else {
+                    pendingCross = reversedIndex
                 }
-                continue
             }
-            if isOlderThanSince(analysis, sinceMinute: sinceMinute) {
-                crossedSince = true
+            runner.log(
+                "read-since: row[-\(reversedIndex + 1)] date=\(analysis.labelDate ?? analysis.axHelpDate ?? "-") time=\(analysis.labelTime ?? analysis.timeRaw ?? "-") ownLabel=\(analysis.labelTime != nil ? "yes" : "no") author=\(analysis.explicitAuthor != nil ? "yes" : "no") older=\(older.map { $0 ? "yes" : "no" } ?? "-") crossed=\(crossedSince ? "yes" : "no")"
+            )
+            if crossedSince, contextRows > 0, analysis.explicitAuthor != nil {
+                rowsExhausted = false
+                break
             }
+        }
+        // The oldest loaded time label is older than `since` with nothing older to confirm it.
+        if !crossedSince, rowsExhausted, let pending = pendingCross {
+            crossedSince = true
+            crossReversedIndex = pending
         }
 
         let analyses = Array(reversedAnalyses.reversed())
         // Time labels sit on the last row of a same-minute group, so everything after
-        // the newest row that is provably older than `since` belongs to `since` or later.
-        let cutIndex = analyses.lastIndex(where: {
-            isOlderThanSince($0, sinceMinute: sinceMinute)
-        })
+        // the newest confirmed row older than `since` belongs to `since` or later.
+        let cutIndex = crossReversedIndex.map { analyses.count - 1 - $0 }
         let indexed = buildMessages(
             from: analyses,
             limit: limit,
@@ -1332,15 +1367,6 @@ extension KakaoTalkTranscriptReader {
                 truncated: truncated
             )
         )
-    }
-
-    /// Decided only from the row's own time label (AXHelp date + time), never from
-    /// message bodies, which may mention arbitrary dates.
-    private func isOlderThanSince(_ analysis: RowAnalysis, sinceMinute: Date) -> Bool {
-        if let exact = TranscriptTime.localDate(date: analysis.axHelpDate, timeRaw: analysis.timeRaw) {
-            return exact < sinceMinute
-        }
-        return isWholeDayBefore(TranscriptTime.localDay(analysis.axHelpDate), sinceMinute: sinceMinute)
     }
 
     private func isWholeDayBefore(_ day: Date?, sinceMinute: Date) -> Bool {
@@ -1460,30 +1486,40 @@ extension KakaoTalkTranscriptReader {
         }
     }
 
-    /// Cheap look at the oldest loaded rows: only time labels (AXHelp date + time)
-    /// and date separators, no body analysis.
+    /// Cheap look at the oldest loaded rows, no body analysis. Uses only rows' own
+    /// time labels (bare time text whose AXHelp is the date); the newer of the first
+    /// two labels is the edge, so one out-of-order label cannot stop paging early.
+    /// A date separator label counts only when no time label is found.
     private func peekOldestLoadedTime(in table: UIElement) -> LoadedEdgeTime? {
         guard let rows = tableRows(of: table) else { return nil }
         let ordered = isReversedOrder(rows, frameCache: FrameCache()) ? Array(rows.reversed()) : rows
+        var labelled: [Date] = []
+        var separatorDay: Date?
         for row in ordered.prefix(Self.peekRowCount) {
-            var separatorDay: Date?
             for text in row.findAll(role: kAXStaticTextRole, limit: 10, maxNodes: 60) {
                 let value = text.stringValue
-                if let help = text.helpText, let date = Self.parseHelpDate(help) {
-                    if let exact = TranscriptTime.localDate(date: date, timeRaw: value.flatMap(extractTimeToken)) {
-                        return .exact(exact)
+                if let ownTime = TranscriptTime.timeLabel(value) {
+                    if let help = text.helpText,
+                       let date = Self.parseHelpDate(help),
+                       let exact = TranscriptTime.localDate(date: date, timeRaw: ownTime)
+                    {
+                        labelled.append(exact)
+                        break
                     }
-                    if separatorDay == nil {
-                        separatorDay = TranscriptTime.localDay(date)
-                    }
-                }
-                if separatorDay == nil, let day = TranscriptTime.separatorDay(value) {
+                } else if separatorDay == nil, labelled.isEmpty, let day = TranscriptTime.separatorDay(value) {
                     separatorDay = day
                 }
             }
-            if let separatorDay {
-                return .day(separatorDay)
+            if labelled.count >= 2 {
+                break
             }
+        }
+        runner.log("read-since: peek labels=\(labelled.map { SinceParser.format($0) }) separator=\(separatorDay.map { SinceParser.format($0) } ?? "-")")
+        if let edge = labelled.max() {
+            return .exact(edge)
+        }
+        if let separatorDay {
+            return .day(separatorDay)
         }
         return nil
     }
@@ -1576,6 +1612,13 @@ private struct RowAnalysis {
     let attachmentCount: Int
     let isSystemLikeRow: Bool
     let axHelpDate: String?
+    /// Date and time from the row's own time label only (see `TranscriptTime.timeLabel`).
+    let labelDate: String?
+    let labelTime: String?
+
+    var labelTimestamp: Date? {
+        TranscriptTime.localDate(date: labelDate, timeRaw: labelTime)
+    }
 
     var referenceFrame: CGRect? {
         bodyCandidate?.frame ?? rowFrame

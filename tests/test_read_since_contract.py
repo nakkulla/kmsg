@@ -79,6 +79,17 @@ class ReadSinceContractTests(unittest.TestCase):
         self.assertIn("for row in rows.reversed()", source)
         self.assertIn("peekOldestLoadedTime", source)
 
+    def test_since_boundary_uses_only_own_time_labels(self) -> None:
+        reader = TRANSCRIPT_READER.read_text(encoding="utf-8")
+        helpers = TRANSCRIPT_TIME.read_text(encoding="utf-8")
+
+        self.assertIn("static func timeLabel(_ text: String?) -> String?", helpers)
+        self.assertIn("let labelDate: String?", reader)
+        self.assertIn("analysis.labelTimestamp.map { $0 < sinceMinute }", reader)
+        self.assertIn("crossReversedIndex = pending", reader)
+        self.assertIn("if let edge = labelled.max()", reader)
+        self.assertIn("ownLabel=", reader)
+
 
 class MCPReadSinceContractTests(unittest.TestCase):
     def test_mcp_read_schema_exposes_since_and_timeout(self) -> None:

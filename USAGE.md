@@ -232,8 +232,10 @@ work, but it fails unless the matching chat window is already exposed.
 older messages (about 50 rows per page), until the oldest loaded message is
 older than `TIME`, the conversation start is reached, `--max-pages` is hit, or
 half of `--timeout-sec` is used. It then scrolls back to the bottom and reads
-from the newest message backwards, stopping at the first message older than
-`TIME`. Message times have minute precision, so `TIME` is compared at the start
+from the newest message backwards, stopping once two consecutive time-labelled
+messages are older than `TIME`. Only a message's own time label (the time text
+whose tooltip carries the date) decides this, so quoted or forwarded content
+with older dates does not end the range. Message times have minute precision, so `TIME` is compared at the start
 of its minute. Combined with `--background-safe`, `--since` does not scroll and
 reads only the rows already loaded in the window.
 
