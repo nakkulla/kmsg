@@ -117,6 +117,30 @@ public final class KakaoTalkApp: Sendable {
         app.activate(options: [.activateIgnoringOtherApps])
     }
 
+    /// The app that is frontmost when a command starts, so `--layout offscreen` can hand
+    /// the front back if window recovery had to bring KakaoTalk forward.
+    public struct FrontmostAppKeeper {
+        private let previous: NSRunningApplication?
+
+        public init(enabled: Bool) {
+            previous = enabled ? NSWorkspace.shared.frontmostApplication : nil
+        }
+
+        /// Returns true when the front was handed back.
+        @discardableResult
+        public func handFrontBack(from kakao: KakaoTalkApp) -> Bool {
+            guard let previous, !previous.isTerminated, previous.bundleIdentifier != KakaoTalkApp.bundleIdentifier else {
+                return false
+            }
+            let kakaoIsFrontmost = NSWorkspace.shared.frontmostApplication?.bundleIdentifier == KakaoTalkApp.bundleIdentifier
+            guard kakaoIsFrontmost else {
+                return false
+            }
+            let previousApp = UIElement.application(pid: previous.processIdentifier)
+            return (try? previousApp.setAttribute(kAXFrontmostAttribute, value: true as CFBoolean)) != nil
+        }
+    }
+
     /// Activate KakaoTalk and wait for a usable window to be available
     /// - Parameter timeout: Maximum time to wait for a usable window (default: 2 seconds)
     /// - Parameter trace: Optional trace logger

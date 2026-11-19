@@ -134,10 +134,21 @@ struct ReadCommand: ParsableCommand {
             throw ExitCode.failure
         }
 
-        let runner = AXActionRunner(traceEnabled: traceAX)
+        let frontmostKeeper = KakaoTalkApp.FrontmostAppKeeper(enabled: layout == .offscreen)
+        // offscreen: keys go to KakaoTalk's process only, so it never has to come to the front.
+        let runner = AXActionRunner(
+            traceEnabled: traceAX,
+            keyTargetPid: layout == .offscreen ? { KakaoTalkApp.runningApplication?.processIdentifier } : nil
+        )
         let kakao = backgroundSafe
             ? try KakaoTalkApp(autoLaunch: false)
             : try AuthBootstrap.requireAuthenticated(traceAX: traceAX)
+        // With no KakaoTalk window left, recovery brings the app forward; give the front back.
+        defer {
+            if frontmostKeeper.handFrontBack(from: kakao) {
+                runner.log("offscreen: front handed back to the previous app")
+            }
+        }
         let chatWindowResolver = ChatWindowResolver(
             kakao: kakao,
             runner: runner,
@@ -193,7 +204,8 @@ struct ReadCommand: ParsableCommand {
             runner.log("read: found existing chat window")
         }
 
-        // --layout offscreen: original position of a moved window, restored unless closed.
+        // --layout offscreen: original position of a moved window. It is restored before the
+        // window is closed too, because KakaoTalk reopens a chat where it was last closed.
         var offscreenOrigin: CGPoint?
         let restoreOffscreenWindow = {
             if let origin = offscreenOrigin {
@@ -202,26 +214,25 @@ struct ReadCommand: ParsableCommand {
         }
 
         defer {
+            restoreOffscreenWindow()
             if resolution.openedTransiently && !keepWindow {
                 let resolvedTitle = window.title ?? ""
                 if chatID == nil && !resolvedTitle.isEmpty && !resolvedTitle.localizedCaseInsensitiveContains(requestedChat) {
                     runner.log("read: skipped auto-close because resolved title '\(resolvedTitle)' did not match query")
-                    restoreOffscreenWindow()
                 } else if chatWindowResolver.closeWindow(window) {
                     runner.log("read: auto-opened chat window closed")
                 } else {
                     runner.log("read: failed to close auto-opened chat window")
-                    restoreOffscreenWindow()
                 }
-            } else {
-                if resolution.openedTransiently && keepWindow {
-                    runner.log("read: auto-opened chat window kept by --keep-window")
-                }
-                restoreOffscreenWindow()
+            } else if resolution.openedTransiently && keepWindow {
+                runner.log("read: auto-opened chat window kept by --keep-window")
             }
         }
 
         offscreenOrigin = chatWindowResolver.moveWindowOffscreen(window)
+        // The reader finds the chat pane through KakaoTalk's focus, which an already open
+        // window does not hold while KakaoTalk stays in the background.
+        chatWindowResolver.takeKeysWithoutActivation(window)
 
         let sinceDate = since.flatMap { SinceParser.parse($0, now: startedAt) }
         let snapshot: TranscriptSnapshot

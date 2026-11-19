@@ -197,6 +197,7 @@ private final class KmsgMCPServer {
     private let backgroundSafeDefault: Bool
     private let traceDefault: Bool
     private let readLayoutDefault: String
+    private let sendLayoutDefault: String
     private let serverVersion: String
     private var initialized = false
     private var shutdown = false
@@ -211,6 +212,8 @@ private final class KmsgMCPServer {
         readLayoutDefault = Self.validReadLayout(env["KMSG_DEFAULT_READ_LAYOUT"])
             ?? Self.validReadLayout(env["KMSG_DEFAULT_LAYOUT"])
             ?? "preserve"
+        // kmsg_send takes no layout argument; KMSG_DEFAULT_LAYOUT alone decides it.
+        sendLayoutDefault = Self.validReadLayout(env["KMSG_DEFAULT_LAYOUT"]) ?? "preserve"
         serverVersion = env["KMSG_MCP_VERSION"]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
             ? env["KMSG_MCP_VERSION"]!.trimmingCharacters(in: .whitespacesAndNewlines)
             : BuildVersion.current
@@ -805,7 +808,7 @@ private final class KmsgMCPServer {
         let keepWindow = boolValue(arguments["keep_window"], defaultValue: false)
         let traceAX = boolValue(arguments["trace_ax"], defaultValue: traceDefault)
 
-        var command = ["send", chat, message]
+        var command = ["send", chat, message, "--layout", sendLayoutDefault]
         if deepRecovery { command.append("--deep-recovery") }
         if keepWindow { command.append("--keep-window") }
         if traceAX { command.append("--trace-ax") }
@@ -961,6 +964,13 @@ private final class KmsgMCPServer {
     }
 
     private func extractErrorCode(_ combinedText: String) -> String {
+        // Checked first: their messages also contain "not found"/"FOCUS" wording below.
+        if combinedText.contains("SEND_UNCONFIRMED") {
+            return "SEND_UNCONFIRMED"
+        }
+        if combinedText.contains("SEND_BUTTON_MISSING") {
+            return "SEND_BUTTON_MISSING"
+        }
         let lowered = combinedText.lowercased()
         if lowered.contains("no such file or directory") || lowered.contains("not found") {
             return "KMSG_BIN_NOT_FOUND"
@@ -990,6 +1000,10 @@ private final class KmsgMCPServer {
             return "Chat was not found in search results. Verify chat name spacing and visibility."
         case "KAKAO_SEARCH_FOCUS_FAILED":
             return "KakaoTalk search input could not be focused. Open KakaoTalk, ensure the chat list is visible, then retry with deep_recovery=true."
+        case "SEND_UNCONFIRMED":
+            return "The send button was pressed but delivery was not confirmed. Do not resend: read the chat first and send again only if the message is absent."
+        case "SEND_BUTTON_MISSING":
+            return "Nothing was sent: the chat window's send button was not found (offscreen layout). Retry once; if it repeats, report it."
         case "ACCESSIBILITY_PERMISSION_DENIED":
             return "Grant Accessibility permission in System Settings > Privacy & Security > Accessibility."
         default:

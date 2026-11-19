@@ -6,9 +6,18 @@ struct AXActionRunner {
 
     private let traceEnabled: Bool
     private let traceWriter: TraceWriter
+    /// When set and resolvable, keyboard events are posted to that process only
+    /// instead of the HID tap, so they reach the target app without it being frontmost
+    /// and never land in whatever app the user is working in.
+    private let keyTargetPid: (() -> pid_t?)?
 
-    init(traceEnabled: Bool) {
+    var postsKeysToTargetOnly: Bool {
+        keyTargetPid?() != nil
+    }
+
+    init(traceEnabled: Bool, keyTargetPid: (() -> pid_t?)? = nil) {
         self.traceEnabled = traceEnabled
+        self.keyTargetPid = keyTargetPid
         self.traceWriter = { message in
             guard let data = "[trace-ax] \(message)\n".data(using: .utf8) else { return }
             FileHandle.standardError.write(data)
@@ -249,10 +258,10 @@ struct AXActionRunner {
             if let down = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: true) {
                 var unicode = Array(unit.utf16)
                 down.keyboardSetUnicodeString(stringLength: unicode.count, unicodeString: &unicode)
-                down.post(tap: .cghidEventTap)
+                postKeyEvent(down)
             }
             if let up = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: false) {
-                up.post(tap: .cghidEventTap)
+                postKeyEvent(up)
             }
             Thread.sleep(forTimeInterval: perCharacterDelay)
         }
@@ -262,11 +271,23 @@ struct AXActionRunner {
         let source = CGEventSource(stateID: .hidSystemState)
         if let down = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: true) {
             down.flags = flags
-            down.post(tap: .cghidEventTap)
+            postKeyEvent(down)
         }
         if let up = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: false) {
             up.flags = flags
-            up.post(tap: .cghidEventTap)
+            postKeyEvent(up)
+        }
+    }
+
+    private func postKeyEvent(_ event: CGEvent) {
+        guard let keyTargetPid else {
+            event.post(tap: .cghidEventTap)
+            return
+        }
+        // Bound to a process: with that process gone the key is dropped, never sent to
+        // whatever app is frontmost.
+        if let pid = keyTargetPid() {
+            event.postToPid(pid)
         }
     }
 

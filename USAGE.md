@@ -226,13 +226,24 @@ The name form supports partial matching. For repeated automation, use a
 `--background-safe` is suitable for automation that must not disturb foreground
 work, but it fails unless the matching chat window is already exposed.
 
-`--layout offscreen` keeps the chat window's size but moves it left of every
-display right after the window is resolved, so long reads (for example
-`--since`) do not cover your work. macOS may clamp the position and leave a thin
-edge visible. Reading does not depend on the window being visible. A window
-that kmsg opened is closed as usual; a window that was already open (or kept
-with `--keep-window`) is moved back to its original position at the end. With
-`--background-safe` the window is not moved.
+`--layout offscreen` keeps KakaoTalk out of your way. The chat window keeps its
+size but is moved past the bottom-right corner of the rightmost display as soon
+as it opens, and the main window goes there too while kmsg searches for the
+chat. macOS clamps the position and leaves a small corner piece visible.
+KakaoTalk is not brought to the front: the search result is opened with
+arrow-down and Enter posted to KakaoTalk's process only, and Enter is sent only
+while the selected row matches the chat name. If another KakaoTalk window holds
+the focus, the window kmsg works in is raised (after it left the displays) so
+it takes the keys; that can lift it above other apps' inactive windows. Reading
+does not depend on the window being visible. Every moved window is put back
+where it was, also when kmsg is stopped with SIGTERM or SIGINT; a window kmsg
+opened is put back just before it is closed (KakaoTalk reopens a chat where it
+was last closed), and a window that was already open (or kept with
+`--keep-window`) stays at its original position. A window a killed run left off
+the displays returns to the main display on the next run. If KakaoTalk has no
+window at all, kmsg has to bring it to the front once to get one and then hands
+the front back to the app that had it. With `--background-safe` nothing is
+moved.
 
 When kmsg has to type the chat name into the main window's search field to
 open a chat, it puts the field back afterwards (also on errors): it clears the
@@ -316,6 +327,7 @@ kmsg send --chat-id <chat-id> <message> [options]
 | `--refresh-cache` | Remove relevant cached paths before sending. |
 | `-k`, `--keep-window` | Keep chat and list windows opened by the command. |
 | `--deep-recovery` | Enable deeper recovery after the fast path fails. |
+| `--layout MODE` | Same modes as `kmsg read`. `offscreen` sends with the KakaoTalk windows off all displays and without bringing KakaoTalk to the front: the text is set in the input and the chat window's own send button is pressed, so no key is typed. It leaves the chat list window open, never falls back to blind typing, and sends nothing (`SEND_BUTTON_MISSING`) when the button is not found. The send counts as done once the input empties; if it does not (`SEND_UNCONFIRMED`), read the chat before sending again. Default: `preserve`. |
 
 Without `--keep-window`, windows opened transiently by the command are closed
 after the send attempt.
@@ -562,7 +574,7 @@ JSON payloads are written to `stdout`. `--trace-ax` diagnostics remain on
 | `KMSG_DEFAULT_BACKGROUND_SAFE` | `false` | Default `background_safe` value for `kmsg_read`. |
 | `KMSG_TRACE_DEFAULT` | `false` | Default `trace_ax` value for MCP tools. |
 | `KMSG_DEFAULT_READ_LAYOUT` | `preserve` | Default MCP read layout: `preserve`, `left`, `right`, `split-left`, `split-right`, or `offscreen`. |
-| `KMSG_DEFAULT_LAYOUT` | `preserve` | Same as `KMSG_DEFAULT_READ_LAYOUT`, used when that one is unset or invalid. Invalid values are ignored. |
+| `KMSG_DEFAULT_LAYOUT` | `preserve` | Same as `KMSG_DEFAULT_READ_LAYOUT`, used when that one is unset or invalid. Invalid values are ignored. MCP `kmsg_send` takes its layout from this variable alone. |
 | `KMSG_MCP_STARTUP_STATUS_CHECK` | `false` | When `true`, MCP initialization also runs `kmsg status`; otherwise it checks only the binary version. |
 | `KMSG_MCP_VERSION` | build version | Overrides MCP server version metadata. |
 

@@ -37,6 +37,9 @@ struct SendCommand: ParsableCommand {
     @Flag(name: [.short, .long], help: "Keep chat and list windows open after sending message")
     var keepWindow: Bool = false
 
+    @Option(name: .long, help: "Window layout while sending: preserve, left, right, split-left, or split-right; offscreen keeps the KakaoTalk windows off all displays and does not bring KakaoTalk to the front")
+    var layout: ChatWindowLayoutMode = .preserve
+
     @Flag(
         name: .long,
         help: ArgumentHelp(
@@ -51,6 +54,8 @@ struct SendCommand: ParsableCommand {
         case inputNotReflected = "INPUT_NOT_REFLECTED"
         case enterNotEffective = "ENTER_NOT_EFFECTIVE"
         case forcedTypingFailed = "FORCED_TYPING_FAILED"
+        case sendButtonMissing = "SEND_BUTTON_MISSING"
+        case sendUnconfirmed = "SEND_UNCONFIRMED"
     }
 
     var recipient: String? {
@@ -111,15 +116,27 @@ struct SendCommand: ParsableCommand {
             throw ExitCode.failure
         }
 
-        let runner = AXActionRunner(traceEnabled: traceAX)
+        let frontmostKeeper = KakaoTalkApp.FrontmostAppKeeper(enabled: layout == .offscreen)
+        // offscreen: keys go to KakaoTalk's process only, so it never has to come to the front.
+        let runner = AXActionRunner(
+            traceEnabled: traceAX,
+            keyTargetPid: layout == .offscreen ? { KakaoTalkApp.runningApplication?.processIdentifier } : nil
+        )
 
         prepareCacheIfNeeded(runner: runner)
         let kakao = try AuthBootstrap.requireAuthenticated(traceAX: traceAX)
+        // With no KakaoTalk window left, recovery brings the app forward; give the front back.
+        defer {
+            if frontmostKeeper.handFrontBack(from: kakao) {
+                runner.log("offscreen: front handed back to the previous app")
+            }
+        }
         let chatWindowResolver = ChatWindowResolver(
             kakao: kakao,
             runner: runner,
             useCache: !noCache,
-            deepRecoveryEnabled: deepRecovery
+            deepRecoveryEnabled: deepRecovery,
+            layoutMode: layout
         )
 
         do {
@@ -144,7 +161,18 @@ struct SendCommand: ParsableCommand {
                 }
             }
 
+            // --layout offscreen: the chat window leaves the displays while sending and returns
+            // before it is closed, because KakaoTalk reopens a chat where it was last closed.
+            var offscreenOrigin = chatWindowResolver.moveWindowOffscreen(resolution.window)
+            let restoreOffscreenWindow = {
+                if let origin = offscreenOrigin {
+                    chatWindowResolver.restoreWindowPosition(resolution.window, to: origin)
+                    offscreenOrigin = nil
+                }
+            }
+            defer { restoreOffscreenWindow() }
             try sendMessageToWindow(resolution.window, kakao: kakao, runner: runner)
+            restoreOffscreenWindow()
             closeWindowsIfNeeded(
                 resolution: resolution,
                 kakao: kakao,
@@ -258,12 +286,19 @@ struct SendCommand: ParsableCommand {
     }
 
     private func sendMessageToWindow(_ window: UIElement, kakao: KakaoTalkApp, runner: AXActionRunner) throws {
-        // Bring KakaoTalk to front so CGEvent key events (Enter) are delivered to KakaoTalk, not the terminal
-        kakao.activate()
-        _ = tryRaiseWindow(window, runner: runner)
+        if layout != .offscreen {
+            // Bring KakaoTalk to front so CGEvent key events (Enter) are delivered to KakaoTalk, not the terminal
+            kakao.activate()
+            _ = tryRaiseWindow(window, runner: runner)
+        }
         Thread.sleep(forTimeInterval: 0.1)
 
         guard let input = resolveMessageInputField(chatWindow: window, kakao: kakao, runner: runner) else {
+            // Blind typing goes to whichever KakaoTalk window takes keys; without KakaoTalk in
+            // front that cannot be confirmed to be this chat, so offscreen never does it.
+            guard layout != .offscreen else {
+                throw KakaoTalkError.actionFailed("[\(SendFailureCode.forcedTypingFailed.rawValue)] Message input field not found (offscreen layout does not type blindly)")
+            }
             let forcedTyped = forceTypeIntoChatWindow(chatWindow: window, kakao: kakao, runner: runner)
             guard forcedTyped else {
                 throw KakaoTalkError.actionFailed("[\(SendFailureCode.forcedTypingFailed.rawValue)] Message input field not found and forced typing fallback failed")
@@ -281,6 +316,12 @@ struct SendCommand: ParsableCommand {
             runner.typeTextWithVerification(message, on: input, label: "message input", attempts: 2)
         guard inputReady else {
             throw KakaoTalkError.actionFailed("[\(SendFailureCode.inputNotReflected.rawValue)] Message input was not reflected")
+        }
+
+        if layout == .offscreen {
+            try pressSendButton(in: window, input: input, runner: runner)
+            print("✓ Message sent to \(targetDescription)")
+            return
         }
 
         var sendSucceeded = runner.pressEnterWithVerification(
@@ -309,6 +350,41 @@ struct SendCommand: ParsableCommand {
         print("✓ Message sent to \(targetDescription)")
     }
 
+    /// offscreen: Enter typed into the input does not arrive while KakaoTalk is in the
+    /// background and the user types in another app, so the chat window's own send button
+    /// is pressed instead. No key is posted; without the button nothing is sent.
+    private func pressSendButton(in window: UIElement, input: UIElement, runner: AXActionRunner) throws {
+        let sendButton = window.findAll(role: kAXButtonRole, limit: 40, maxNodes: 1500).first { button in
+            let title = (button.title ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            return (title == "전송" || title == "send") && button.isEnabled && supportsAction(kAXPressAction, on: button)
+        }
+        guard let sendButton else {
+            _ = runner.setTextWithVerification("", on: input, label: "message input clear", attempts: 1)
+            throw KakaoTalkError.actionFailed("[\(SendFailureCode.sendButtonMissing.rawValue)] Send button not found in the chat window; nothing was sent")
+        }
+
+        // KakaoTalk can send and still answer the press with an error, so the press result
+        // decides nothing: the message counts as sent once the input is empty.
+        let inputIsEmpty = { (input.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+        let pressedAt = Date()
+        AXUIElementSetMessagingTimeout(sendButton.axElement, 1.5)
+        do {
+            try sendButton.press()
+            runner.log("message input: send button pressed (\(String(format: "%.2f", Date().timeIntervalSince(pressedAt)))s)")
+        } catch {
+            runner.log("message input: send button press returned \(error) after \(String(format: "%.2f", Date().timeIntervalSince(pressedAt)))s; checking the input")
+        }
+        let sent = runner.waitUntil(label: "message input emptied by send button", timeout: 5.0, pollInterval: 0.05, condition: inputIsEmpty)
+        runner.log("message input: \(sent ? "emptied" : "still filled") \(String(format: "%.2f", Date().timeIntervalSince(pressedAt)))s after the press")
+        guard sent else {
+            // The press was issued, so the message may still go out. The text is removed so it
+            // cannot be sent later by hand, and the caller is told not to retry blindly.
+            _ = runner.setTextWithVerification("", on: input, label: "message input clear", attempts: 1)
+            throw KakaoTalkError.actionFailed("[\(SendFailureCode.sendUnconfirmed.rawValue)] Send button was pressed but the input did not empty; read the chat before sending again")
+        }
+        runner.log("message input: sent via send button")
+    }
+
     private func closeWindowsIfNeeded(
         resolution: ChatWindowResolution,
         kakao: KakaoTalkApp,
@@ -326,7 +402,10 @@ struct SendCommand: ParsableCommand {
             runner.log("send: close window could not be verified")
         }
 
-        if let listWindow = kakao.chatListWindow,
+        // offscreen leaves the chat list open: with no window left, the next call would have
+        // to bring KakaoTalk to the front to get one back.
+        if layout != .offscreen,
+           let listWindow = kakao.chatListWindow,
            !areSameAXElement(listWindow, resolution.window)
         {
             if resolver.closeWindow(listWindow) {
@@ -397,7 +476,9 @@ struct SendCommand: ParsableCommand {
             }
 
             runner.log("message input search attempt \(attempt): no candidate resolved; reactivating chat window")
-            kakao.activate()
+            if layout != .offscreen {
+                kakao.activate()
+            }
             _ = runner.focusWithVerification(chatWindow, label: "chat window", attempts: 1)
             Thread.sleep(forTimeInterval: 0.05)
         }

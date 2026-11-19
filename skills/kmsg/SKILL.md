@@ -90,8 +90,9 @@ kmsg read --chat-id "<chat_id>" --since 2026-11-18T07:00:00+09:00 --json
 (ISO 8601, or relative `90m`, `24h`, `2d`); `--limit` is only a safety cap
 there. Check `truncated` in the result: when `true`, say that the oldest part of
 the range is missing. Long ranges can take minutes; raise `--timeout-sec` if
-needed. Add `--layout offscreen` so the chat window stays off screen while it
-reads instead of covering the user's work.
+needed. Add `--layout offscreen` so the KakaoTalk windows stay off screen and
+KakaoTalk stays in the background instead of covering the user's work;
+`kmsg send` takes the same option.
 
 When the user explicitly wants zero focus changes, add `--background-safe`.
 This mode only reads an already exposed matching window and can fail instead of

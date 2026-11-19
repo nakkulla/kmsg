@@ -80,6 +80,56 @@ private struct SearchCandidate {
     let clickPoint: CGPoint?
 }
 
+/// A chat window the resolver already moved off the displays the moment it opened,
+/// with the origin the caller's `moveWindowOffscreen` hands back for the restore.
+private final class EarlyOffscreenMove {
+    var window: UIElement?
+    var origin: CGPoint?
+}
+
+/// Windows currently parked off the displays. A stop signal puts them back before the
+/// process exits: the MCP server terminates a call that runs over its time budget, and
+/// `defer` does not run then.
+private final class OffscreenParking: @unchecked Sendable {
+    static let shared = OffscreenParking()
+
+    private let lock = NSLock()
+    private var parked: [(window: UIElement, origin: CGPoint)] = []
+    private var signalSources: [DispatchSourceSignal] = []
+
+    func park(_ window: UIElement, origin: CGPoint) {
+        lock.lock()
+        defer { lock.unlock() }
+        if signalSources.isEmpty {
+            for stopSignal in [SIGTERM, SIGINT] {
+                signal(stopSignal, SIG_IGN)
+                let source = DispatchSource.makeSignalSource(signal: stopSignal, queue: .global())
+                source.setEventHandler { [self] in
+                    restoreAll()
+                    exit(128 + stopSignal)
+                }
+                source.resume()
+                signalSources.append(source)
+            }
+        }
+        parked.append((window, origin))
+    }
+
+    func unpark(_ window: UIElement) {
+        lock.lock()
+        defer { lock.unlock() }
+        parked.removeAll { CFEqual($0.window.axElement, window.axElement) }
+    }
+
+    private func restoreAll() {
+        lock.lock()
+        defer { lock.unlock() }
+        for entry in parked {
+            try? entry.window.setPosition(entry.origin)
+        }
+    }
+}
+
 struct ChatWindowResolver {
     private static let minimumReadableWindowSize = CGSize(width: 760, height: 900)
     private static let minimumSplitWindowSize = CGSize(width: 520, height: 680)
@@ -91,6 +141,7 @@ struct ChatWindowResolver {
     private let deepRecoveryEnabled: Bool
     private let layoutMode: ChatWindowLayoutMode
     private let interactionMode: ChatWindowInteractionMode
+    private let earlyOffscreenMove = EarlyOffscreenMove()
 
     init(
         kakao: KakaoTalkApp,
@@ -106,6 +157,41 @@ struct ChatWindowResolver {
         self.deepRecoveryEnabled = deepRecoveryEnabled
         self.layoutMode = layoutMode
         self.interactionMode = interactionMode
+    }
+
+    /// `--layout offscreen` keeps KakaoTalk out of the user's way: windows stay off the
+    /// displays, KakaoTalk is not brought to the front, and nothing is clicked.
+    private var unobtrusive: Bool {
+        layoutMode == .offscreen && interactionMode == .allowUIAutomation
+    }
+
+    private func bringForward(_ window: UIElement) {
+        guard !unobtrusive else { return }
+        kakao.activate()
+        _ = tryRaiseWindow(window)
+    }
+
+    /// offscreen: makes `window` the one KakaoTalk routes keys and focus to, without
+    /// bringing KakaoTalk to the front. Keys posted to the process go to its focused
+    /// window, so another open chat would receive them otherwise. AXRaise lifts the
+    /// window above other apps' inactive windows, so it runs only when the window does
+    /// not hold the focus already, and callers move the window off the displays first.
+    /// Returns true outside the offscreen layout. Holding the focus does not guarantee
+    /// that text keys arrive (they do not while the user types in another app), so
+    /// callers confirm the effect of each key and sending uses no keys at all.
+    @discardableResult
+    func takeKeysWithoutActivation(_ window: UIElement) -> Bool {
+        guard unobtrusive else { return true }
+        let holdsFocus = { kakao.focusedWindow.map { areSameAXElement($0, window) } ?? false }
+        if holdsFocus() {
+            return true
+        }
+        _ = tryRaiseWindow(window)
+        let taken = runner.waitUntil(label: "window takes keys", timeout: 0.5, pollInterval: 0.04, condition: holdsFocus)
+        if !taken {
+            runner.log("offscreen: window '\(window.title ?? "")' did not take KakaoTalk's focus")
+        }
+        return taken
     }
 
     func resolve(query: String) throws -> ChatWindowResolution {
@@ -163,8 +249,7 @@ struct ChatWindowResolver {
     func closeWindow(_ window: UIElement) -> Bool {
         let closeAction = "AXClose"
 
-        kakao.activate()
-        _ = tryRaiseWindow(window)
+        bringForward(window)
 
         if supportsAction(closeAction, on: window) {
             do {
@@ -177,6 +262,18 @@ struct ChatWindowResolver {
             }
         }
 
+        // The window's own close button works without KakaoTalk being frontmost.
+        if let standardClose: AXUIElement = window.attributeOptional(kAXCloseButtonAttribute) {
+            do {
+                try UIElement(standardClose).press()
+                if waitForWindowClosed(window, label: "close via AXCloseButton") {
+                    return true
+                }
+            } catch {
+                runner.log("close window: AXCloseButton press failed (\(error))")
+            }
+        }
+
         if let closeButton = findCloseButton(in: window) {
             do {
                 try closeButton.press()
@@ -186,6 +283,13 @@ struct ChatWindowResolver {
             } catch {
                 runner.log("close window: button press failed (\(error))")
             }
+        }
+
+        // cmd+W closes whichever KakaoTalk window takes keys; without KakaoTalk in front
+        // that cannot be confirmed to be this one.
+        guard !unobtrusive else {
+            runner.log("close window: cmd+w fallback skipped (offscreen layout)")
+            return false
         }
 
         runner.log("close window: fallback via cmd+w")
@@ -293,6 +397,24 @@ struct ChatWindowResolver {
     private func openChatViaSearch(query: String, in rootWindow: UIElement, fallbackWindow: UIElement) throws -> UIElement {
         runner.log("search: locating search field")
 
+        // offscreen: the main window leaves the displays for the lookup and returns on every exit.
+        // A minimized main window (the Hermes relay minimizes it after every call) comes up
+        // while it is searched; it is minimized again off the displays before it moves back.
+        let rootWasMinimized: Bool = unobtrusive ? (rootWindow.attributeOptional(kAXMinimizedAttribute) ?? false) : false
+        let rootOrigin = unobtrusive ? moveWindowOffscreen(rootWindow) : nil
+        defer {
+            if let rootOrigin {
+                if rootWasMinimized {
+                    try? rootWindow.setAttribute(kAXMinimizedAttribute, value: true as CFBoolean)
+                    runner.log("offscreen: main window minimized again")
+                }
+                restoreWindowPosition(rootWindow, to: rootOrigin)
+            }
+        }
+        guard takeKeysWithoutActivation(rootWindow) else {
+            throw KakaoTalkError.actionFailed("[\(ChatWindowFailureCode.focusFail.rawValue)] KakaoTalk main window could not take keys without coming to the front")
+        }
+
         guard let searchField = locateSearchField(in: rootWindow) else {
             throw KakaoTalkError.elementNotFound("[\(ChatWindowFailureCode.searchMiss.rawValue)] Search field not found")
         }
@@ -322,7 +444,7 @@ struct ChatWindowResolver {
             runner.typeTextWithVerification(query, on: searchField, label: "search field input", attempts: 2)
 
         guard searchInputReady else {
-            runner.pressEscape()
+            dismissSearchAfterFailure()
             throw KakaoTalkError.actionFailed("[\(ChatWindowFailureCode.inputNotReflected.rawValue)] Search keyword was not entered")
         }
 
@@ -333,7 +455,7 @@ struct ChatWindowResolver {
 
         let matchingCandidates = waitForMatchingSearchResults(query: query, rootWindow: rootWindow)
         guard let matchingResult = pickBestSearchResult(from: matchingCandidates) else {
-            runner.pressEscape()
+            dismissSearchAfterFailure()
             throw KakaoTalkError.elementNotFound("[\(ChatWindowFailureCode.searchMiss.rawValue)] No search result found for '\(query)'")
         }
 
@@ -347,7 +469,7 @@ struct ChatWindowResolver {
             resolveOpenedChatWindowFast(query: query) != nil
         }
         guard openTriggered else {
-            runner.pressEscape()
+            dismissSearchAfterFailure()
             throw KakaoTalkError.actionFailed("[\(ChatWindowFailureCode.searchMiss.rawValue)] Could not open matched search result")
         }
 
@@ -362,6 +484,14 @@ struct ChatWindowResolver {
 
         closeWindowsOpened(after: windowsBeforeOpen)
         throw KakaoTalkError.windowNotFound("[\(ChatWindowFailureCode.windowNotReady.rawValue)] Chat window for '\(query)' did not open")
+    }
+
+    /// Escape backs out of the search while KakaoTalk is frontmost. Posted to the process
+    /// with the list focused it closes the main window instead, so offscreen leaves the
+    /// cleanup to the search field restore.
+    private func dismissSearchAfterFailure() {
+        guard !unobtrusive else { return }
+        runner.pressEscape()
     }
 
     private func openChatListRow(chatID: String, query: String, in chatListWindow: UIElement, fallbackWindow: UIElement) -> UIElement? {
@@ -423,8 +553,7 @@ struct ChatWindowResolver {
             return
         }
 
-        kakao.activate()
-        _ = tryRaiseWindow(window)
+        bringForward(window)
 
         // preserve mode (default) keeps the user's window size/position untouched;
         // only bring it forward. Resizing is opt-in via --layout left/right.
@@ -558,13 +687,19 @@ struct ChatWindowResolver {
 
     // MARK: - Offscreen layout
 
-    /// For `--layout offscreen`: moves the window left of the union of all displays
-    /// so a long read does not cover the user's work. macOS may clamp the position
-    /// and leave a sliver visible; that is accepted. Returns the original origin
-    /// when the window was moved, for `restoreWindowPosition`.
+    /// For `--layout offscreen`: moves the window past the bottom-right corner of the
+    /// rightmost display so it does not cover the user's work. macOS clamps the position
+    /// and keeps a small piece visible (about 40x32 at that corner, against a 40pt-wide
+    /// full-height strip when moved sideways); that is accepted. Returns the original
+    /// origin when the window was moved, for `restoreWindowPosition`.
     func moveWindowOffscreen(_ window: UIElement) -> CGPoint? {
         guard layoutMode == .offscreen, interactionMode == .allowUIAutomation else {
             return nil
+        }
+        if let early = earlyOffscreenMove.window, areSameAXElement(early, window), let origin = earlyOffscreenMove.origin {
+            earlyOffscreenMove.window = nil
+            earlyOffscreenMove.origin = nil
+            return origin
         }
         guard let frame = window.frame else {
             runner.log("offscreen: window frame unavailable; leaving window in place")
@@ -575,21 +710,32 @@ struct ChatWindowResolver {
             runner.log("offscreen: display list unavailable; leaving window in place")
             return nil
         }
-        let union = displays.dropFirst().reduce(first) { $0.union($1) }
-        let target = CGPoint(x: union.minX - frame.width - 100, y: frame.minY)
+        // A run that was killed outright leaves its window parked. Its origin is lost, so
+        // such a window goes back to the main display instead of to the corner again.
+        var origin = frame.origin
+        let visibleArea = displays.map { $0.intersection(frame) }.filter { !$0.isNull }.reduce(0) { $0 + $1.width * $1.height }
+        if frame.width > 0, frame.height > 0, visibleArea < frame.width * frame.height * 0.25 {
+            origin = CGPoint(x: first.minX + 80, y: first.minY + 80)
+            runner.log("offscreen: window was already off the displays; it will return to \(Int(origin.x)),\(Int(origin.y))")
+        }
+        let rightmost = displays.max { $0.maxX < $1.maxX } ?? first
+        let target = CGPoint(x: rightmost.maxX + 500, y: rightmost.maxY + 500)
+        OffscreenParking.shared.park(window, origin: origin)
         do {
             try window.setPosition(target)
         } catch {
+            OffscreenParking.shared.unpark(window)
             runner.log("offscreen: move failed (\(error))")
             return nil
         }
         Thread.sleep(forTimeInterval: 0.08)
         let landed = window.position.map { "\(Int($0.x)),\(Int($0.y))" } ?? "unknown"
         runner.log("offscreen: moved from \(Int(frame.minX)),\(Int(frame.minY)) toward \(Int(target.x)),\(Int(target.y)); now \(landed)")
-        return frame.origin
+        return origin
     }
 
     func restoreWindowPosition(_ window: UIElement, to origin: CGPoint) {
+        OffscreenParking.shared.unpark(window)
         do {
             try window.setPosition(origin)
             runner.log("offscreen: restored window to \(Int(origin.x)),\(Int(origin.y))")
@@ -1021,6 +1167,10 @@ struct ChatWindowResolver {
         searchField: UIElement,
         opened: () -> Bool
     ) -> Bool {
+        if unobtrusive {
+            return openSearchResultViaKeyboard(candidate, query: query, rootWindow: rootWindow, searchField: searchField, opened: opened)
+        }
+
         let result = candidate.element
         var didTriggerAction = false
 
@@ -1091,6 +1241,71 @@ struct ChatWindowResolver {
         }
 
         return didTriggerAction
+    }
+
+    /// offscreen layout: the main window is off the displays, so no point can be clicked.
+    /// Arrow-down walks the result rows from the search field (KakaoTalk reports the
+    /// selected row as AXSelected); Enter is sent only while the selected row is the
+    /// matched one. Keys go to KakaoTalk's process only, never to the frontmost app.
+    private func openSearchResultViaKeyboard(
+        _ candidate: SearchCandidate,
+        query: String,
+        rootWindow: UIElement,
+        searchField: UIElement,
+        opened: () -> Bool
+    ) -> Bool {
+        guard runner.postsKeysToTargetOnly else {
+            runner.log("search: keyboard open skipped (keys are not bound to KakaoTalk's process)")
+            return false
+        }
+        guard searchField.isFocused || runner.focusWithVerification(searchField, label: "search field (keyboard open)", attempts: 1) else {
+            runner.log("search: keyboard open skipped (search field focus unavailable)")
+            return false
+        }
+
+        // The selection has to move on every arrow key, the first included: a row that was
+        // selected beforehand proves nothing about where KakaoTalk routes the keys.
+        var previous = selectedSearchRow(in: rootWindow)
+        for step in 1...Self.keyboardOpenMaxSteps {
+            runner.pressDownArrowKey()
+            var selected: UIElement?
+            _ = runner.waitUntil(label: "search row selection \(step)", timeout: 0.4, pollInterval: 0.02, evaluateAfterTimeout: false) {
+                selected = selectedSearchRow(in: rootWindow)
+                guard let selected else { return false }
+                return previous.map { !areSameAXElement($0, selected) } ?? true
+            }
+            guard let selected, previous.map({ !areSameAXElement($0, selected) }) ?? true else {
+                runner.log("search: keyboard open stopped at step \(step) (selection did not move)")
+                return false
+            }
+            let match = bestQueryMatch(query: query, in: selected, textLimit: 6, textNodeBudget: 80)
+            if match.score > 0, match.matchedText == candidate.matchedText {
+                runner.log("search: row \(step) selected and matches; opening via Enter")
+                runner.pressEnterKey()
+                // The new window appears on a display; move it off at once, not after the
+                // search field cleanup, so it only flashes.
+                if runner.waitUntil(label: "search open confirm (keyboard)", timeout: 0.8, pollInterval: 0.02, evaluateAfterTimeout: false, condition: opened),
+                   let openedWindow = resolveOpenedChatWindowFast(query: query),
+                   let origin = moveWindowOffscreen(openedWindow)
+                {
+                    earlyOffscreenMove.window = openedWindow
+                    earlyOffscreenMove.origin = origin
+                }
+                return true
+            }
+            previous = selected
+        }
+        runner.log("search: keyboard open found no selected row matching '\(query)'")
+        return false
+    }
+
+    /// The matched row can sit below other results (friends, rooms with a longer name).
+    private static let keyboardOpenMaxSteps = 40
+
+    private func selectedSearchRow(in rootWindow: UIElement) -> UIElement? {
+        rootWindow.findAll(role: kAXRowRole, limit: 48, maxNodes: 1500).first { row in
+            (row.attributeOptional(kAXSelectedAttribute) as Bool?) ?? false
+        }
     }
 
     // MARK: - Search list transition and click verification
