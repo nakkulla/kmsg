@@ -217,7 +217,7 @@ A chat name and `--chat-id` are mutually exclusive.
 | `-k`, `--keep-window` | Keep a chat window opened by the command. |
 | `--background-safe` | Read only an already exposed matching window without launching, activating, logging in, searching, opening, resizing, or closing UI. |
 | `--deep-recovery` | Enable deeper window recovery after the fast path fails. |
-| `--layout MODE` | Use `preserve`, `left`, `right`, `split-left`, or `split-right`. Default: `preserve`. |
+| `--layout MODE` | Use `preserve`, `left`, `right`, `split-left`, `split-right`, or `offscreen`. Default: `preserve`. |
 | `--json` | Return one structured JSON document. |
 
 The name form supports partial matching. For repeated automation, use a
@@ -225,6 +225,19 @@ The name form supports partial matching. For repeated automation, use a
 
 `--background-safe` is suitable for automation that must not disturb foreground
 work, but it fails unless the matching chat window is already exposed.
+
+`--layout offscreen` keeps the chat window's size but moves it left of every
+display right after the window is resolved, so long reads (for example
+`--since`) do not cover your work. macOS may clamp the position and leave a thin
+edge visible. Reading does not depend on the window being visible. A window
+that kmsg opened is closed as usual; a window that was already open (or kept
+with `--keep-window`) is moved back to its original position at the end. With
+`--background-safe` the window is not moved.
+
+When kmsg has to type the chat name into the main window's search field to
+open a chat, it puts the field back afterwards (also on errors): it clears the
+name it typed, or restores the text that was there before. If the field holds
+some other text by then, kmsg leaves it alone.
 
 #### Reading since a time
 
@@ -548,7 +561,8 @@ JSON payloads are written to `stdout`. `--trace-ax` diagnostics remain on
 | `KMSG_DEFAULT_DEEP_RECOVERY` | `false` | Default `deep_recovery` value for MCP tools. |
 | `KMSG_DEFAULT_BACKGROUND_SAFE` | `false` | Default `background_safe` value for `kmsg_read`. |
 | `KMSG_TRACE_DEFAULT` | `false` | Default `trace_ax` value for MCP tools. |
-| `KMSG_DEFAULT_READ_LAYOUT` | `preserve` | Default MCP read layout: `preserve`, `left`, `right`, `split-left`, or `split-right`. |
+| `KMSG_DEFAULT_READ_LAYOUT` | `preserve` | Default MCP read layout: `preserve`, `left`, `right`, `split-left`, `split-right`, or `offscreen`. |
+| `KMSG_DEFAULT_LAYOUT` | `preserve` | Same as `KMSG_DEFAULT_READ_LAYOUT`, used when that one is unset or invalid. Invalid values are ignored. |
 | `KMSG_MCP_STARTUP_STATUS_CHECK` | `false` | When `true`, MCP initialization also runs `kmsg status`; otherwise it checks only the binary version. |
 | `KMSG_MCP_VERSION` | build version | Overrides MCP server version metadata. |
 

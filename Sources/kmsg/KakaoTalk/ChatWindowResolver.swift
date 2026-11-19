@@ -7,6 +7,13 @@ enum ChatWindowLayoutMode: String {
     case right
     case splitLeft = "split-left"
     case splitRight = "split-right"
+    /// Keep the size, but move the chat window off every display while reading.
+    case offscreen
+
+    /// Whether `standardizeReadableWindow` resizes/moves windows on screen.
+    var resizesWindows: Bool {
+        self != .preserve && self != .offscreen
+    }
 
     var isRightAligned: Bool {
         self == .right || self == .splitRight
@@ -294,6 +301,15 @@ struct ChatWindowResolver {
             throw KakaoTalkError.actionFailed("[\(ChatWindowFailureCode.focusFail.rawValue)] Could not focus search field")
         }
 
+        // kmsg types the chat name into the main search field; put the field back on
+        // every exit so the chat list is not left filtered (and later `chats` sees all rows).
+        let originalSearchText = searchField.stringValue ?? ""
+        defer {
+            // The field handle can go stale once the chat opens; re-locate it then.
+            let field = searchField.role != nil ? searchField : (locateSearchField(in: rootWindow) ?? searchField)
+            restoreSearchField(field, typedQuery: query, originalValue: originalSearchText)
+        }
+
         _ = runner.setTextWithVerification("", on: searchField, label: "search field clear", attempts: 1)
 
         let searchInputReady =
@@ -393,7 +409,8 @@ struct ChatWindowResolver {
 
         // preserve mode (default) keeps the user's window size/position untouched;
         // only bring it forward. Resizing is opt-in via --layout left/right.
-        guard layoutMode != .preserve else {
+        // offscreen moves only the resolved chat window (moveWindowOffscreen).
+        guard layoutMode.resizesWindows else {
             return
         }
 
@@ -456,7 +473,7 @@ struct ChatWindowResolver {
         preferredSize: CGSize,
         currentFrame: CGRect?
     ) -> CGRect? {
-        guard layoutMode != .preserve else {
+        guard layoutMode.resizesWindows else {
             return nil
         }
 
@@ -501,20 +518,111 @@ struct ChatWindowResolver {
     }
 
     private func screenFrame(containing frame: CGRect) -> CGRect? {
+        let referencePoint = CGPoint(x: frame.midX, y: frame.midY)
+        return activeDisplayBounds().first { $0.contains(referencePoint) }
+    }
+
+    /// Bounds of every active display in global (AX, top-left origin) coordinates.
+    private func activeDisplayBounds() -> [CGRect] {
         var displayCount: UInt32 = 0
         guard CGGetActiveDisplayList(0, nil, &displayCount) == .success, displayCount > 0 else {
-            return nil
+            return []
         }
 
         var displays = [CGDirectDisplayID](repeating: 0, count: Int(displayCount))
         guard CGGetActiveDisplayList(displayCount, &displays, &displayCount) == .success else {
-            return nil
+            return []
         }
 
-        let referencePoint = CGPoint(x: frame.midX, y: frame.midY)
-        return displays
-            .map(CGDisplayBounds)
-            .first { $0.contains(referencePoint) }
+        return displays.prefix(Int(displayCount)).map(CGDisplayBounds)
+    }
+
+    // MARK: - Offscreen layout
+
+    /// For `--layout offscreen`: moves the window left of the union of all displays
+    /// so a long read does not cover the user's work. macOS may clamp the position
+    /// and leave a sliver visible; that is accepted. Returns the original origin
+    /// when the window was moved, for `restoreWindowPosition`.
+    func moveWindowOffscreen(_ window: UIElement) -> CGPoint? {
+        guard layoutMode == .offscreen, interactionMode == .allowUIAutomation else {
+            return nil
+        }
+        guard let frame = window.frame else {
+            runner.log("offscreen: window frame unavailable; leaving window in place")
+            return nil
+        }
+        let displays = activeDisplayBounds()
+        guard let first = displays.first else {
+            runner.log("offscreen: display list unavailable; leaving window in place")
+            return nil
+        }
+        let union = displays.dropFirst().reduce(first) { $0.union($1) }
+        let target = CGPoint(x: union.minX - frame.width - 100, y: frame.minY)
+        do {
+            try window.setPosition(target)
+        } catch {
+            runner.log("offscreen: move failed (\(error))")
+            return nil
+        }
+        Thread.sleep(forTimeInterval: 0.08)
+        let landed = window.position.map { "\(Int($0.x)),\(Int($0.y))" } ?? "unknown"
+        runner.log("offscreen: moved from \(Int(frame.minX)),\(Int(frame.minY)) toward \(Int(target.x)),\(Int(target.y)); now \(landed)")
+        return frame.origin
+    }
+
+    func restoreWindowPosition(_ window: UIElement, to origin: CGPoint) {
+        do {
+            try window.setPosition(origin)
+            runner.log("offscreen: restored window to \(Int(origin.x)),\(Int(origin.y))")
+        } catch {
+            runner.log("offscreen: restore failed (\(error))")
+        }
+    }
+
+    // MARK: - Search field cleanup
+
+    /// Puts the main search field back the way kmsg found it after kmsg typed `typedQuery`.
+    /// Leaves it alone when its text is neither kmsg's query nor empty (the user changed it).
+    func restoreSearchField(_ field: UIElement, typedQuery: String, originalValue: String) {
+        let current = (field.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let typed = typedQuery.trimmingCharacters(in: .whitespacesAndNewlines)
+        let original = originalValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if current == original {
+            return
+        }
+        guard current == typed || current.isEmpty else {
+            runner.log("search: field text changed by someone else; leaving it")
+            return
+        }
+
+        if original.isEmpty, !current.isEmpty, let clearButton = searchClearButton(of: field) {
+            do {
+                try clearButton.press()
+                runner.log("search: pressed search field clear button")
+            } catch {
+                runner.log("search: clear button press failed (\(error))")
+            }
+        }
+        if (field.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines) != original {
+            _ = runner.setTextWithVerification(originalValue, on: field, label: "search field restore", attempts: 2)
+        }
+    }
+
+    private func searchClearButton(of field: UIElement) -> UIElement? {
+        if let cancel: AXUIElement = field.attributeOptional("AXCancelButton") {
+            return UIElement(cancel)
+        }
+        return field.children.first { child in
+            guard child.role == kAXButtonRole else { return false }
+            let subrole: String? = child.attributeOptional(kAXSubroleAttribute)
+            if subrole == "AXCancelButton" {
+                return true
+            }
+            let label = [child.title, child.axDescription, child.identifier]
+                .compactMap { $0?.lowercased() }
+                .joined(separator: " ")
+            return label.contains("cancel") || label.contains("clear") || label.contains("지우기") || label.contains("취소")
+        }
     }
 
     private func applyWindowFrame(_ frame: CGRect, to window: UIElement, label: String) {

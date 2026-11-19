@@ -207,7 +207,10 @@ private final class KmsgMCPServer {
         deepRecoveryDefault = (env["KMSG_DEFAULT_DEEP_RECOVERY"] ?? "false").lowercased() == "true"
         backgroundSafeDefault = (env["KMSG_DEFAULT_BACKGROUND_SAFE"] ?? "false").lowercased() == "true"
         traceDefault = (env["KMSG_TRACE_DEFAULT"] ?? "false").lowercased() == "true"
-        readLayoutDefault = Self.validReadLayout(env["KMSG_DEFAULT_READ_LAYOUT"]) ?? "preserve"
+        // KMSG_DEFAULT_READ_LAYOUT (older name) wins over KMSG_DEFAULT_LAYOUT; invalid values are ignored.
+        readLayoutDefault = Self.validReadLayout(env["KMSG_DEFAULT_READ_LAYOUT"])
+            ?? Self.validReadLayout(env["KMSG_DEFAULT_LAYOUT"])
+            ?? "preserve"
         serverVersion = env["KMSG_MCP_VERSION"]?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
             ? env["KMSG_MCP_VERSION"]!.trimmingCharacters(in: .whitespacesAndNewlines)
             : BuildVersion.current
@@ -355,9 +358,9 @@ private final class KmsgMCPServer {
                         ],
                         "layout": [
                             "type": "string",
-                            "enum": ["preserve", "left", "right", "split-left", "split-right"],
+                            "enum": ["preserve", "left", "right", "split-left", "split-right", "offscreen"],
                             "default": readLayoutDefault,
-                            "description": "Window layout before reading",
+                            "description": "Window layout before reading; offscreen moves the chat window off all displays while reading (default from KMSG_DEFAULT_READ_LAYOUT or KMSG_DEFAULT_LAYOUT)",
                         ],
                     ],
                     "additionalProperties": false,
@@ -572,8 +575,8 @@ private final class KmsgMCPServer {
         guard let layout = Self.validReadLayout(arguments["layout"] as? String ?? readLayoutDefault) else {
             return errorPayload(
                 code: "INVALID_ARGUMENT",
-                message: "layout must be preserve, left, right, split-left, or split-right",
-                hint: "Use layout=preserve, layout=left, layout=right, layout=split-left, or layout=split-right.",
+                message: "layout must be preserve, left, right, split-left, split-right, or offscreen",
+                hint: "Use layout=preserve, layout=left, layout=right, layout=split-left, layout=split-right, or layout=offscreen.",
                 rawStdout: "",
                 rawStderr: "",
                 latencyMs: 0
@@ -1015,7 +1018,7 @@ private final class KmsgMCPServer {
         guard let raw else { return nil }
         let normalized = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         switch normalized {
-        case "preserve", "left", "right", "split-left", "split-right":
+        case "preserve", "left", "right", "split-left", "split-right", "offscreen":
             return normalized
         default:
             return nil

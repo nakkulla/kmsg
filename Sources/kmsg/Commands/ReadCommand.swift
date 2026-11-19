@@ -95,7 +95,7 @@ struct ReadCommand: ParsableCommand {
     )
     var deepRecovery: Bool = false
 
-    @Option(name: .long, help: "Window layout before reading: preserve, left, right, split-left, or split-right")
+    @Option(name: .long, help: "Window layout before reading: preserve, left, right, split-left, or split-right; offscreen moves the chat window off all displays while reading")
     var layout: ChatWindowLayoutMode = .preserve
 
     @Flag(name: .long, help: "Output in JSON format")
@@ -193,20 +193,35 @@ struct ReadCommand: ParsableCommand {
             runner.log("read: found existing chat window")
         }
 
+        // --layout offscreen: original position of a moved window, restored unless closed.
+        var offscreenOrigin: CGPoint?
+        let restoreOffscreenWindow = {
+            if let origin = offscreenOrigin {
+                chatWindowResolver.restoreWindowPosition(window, to: origin)
+            }
+        }
+
         defer {
             if resolution.openedTransiently && !keepWindow {
                 let resolvedTitle = window.title ?? ""
                 if chatID == nil && !resolvedTitle.isEmpty && !resolvedTitle.localizedCaseInsensitiveContains(requestedChat) {
                     runner.log("read: skipped auto-close because resolved title '\(resolvedTitle)' did not match query")
+                    restoreOffscreenWindow()
                 } else if chatWindowResolver.closeWindow(window) {
                     runner.log("read: auto-opened chat window closed")
                 } else {
                     runner.log("read: failed to close auto-opened chat window")
+                    restoreOffscreenWindow()
                 }
-            } else if resolution.openedTransiently && keepWindow {
-                runner.log("read: auto-opened chat window kept by --keep-window")
+            } else {
+                if resolution.openedTransiently && keepWindow {
+                    runner.log("read: auto-opened chat window kept by --keep-window")
+                }
+                restoreOffscreenWindow()
             }
         }
+
+        offscreenOrigin = chatWindowResolver.moveWindowOffscreen(window)
 
         let sinceDate = since.flatMap { SinceParser.parse($0, now: startedAt) }
         let snapshot: TranscriptSnapshot

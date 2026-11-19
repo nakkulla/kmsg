@@ -82,7 +82,8 @@ kmsg send "Chat name" "Hello" --dry-run
 (`null` when there is no badge). `kmsg read --since` reads every message at or
 after a time instead of the latest N, loading older history as needed. Pass an
 ISO 8601 time (`2026-11-18T07:00:00+09:00`) or a relative span (`90m`, `24h`,
-`2d`).
+`2d`). Add `--layout offscreen` to move the chat window off screen while it
+reads, so it does not cover your work.
 
 `kmsg status` requests Accessibility permission, launches KakaoTalk when
 needed, and checks authentication. The final command is a dry run and does not

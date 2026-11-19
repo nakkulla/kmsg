@@ -137,6 +137,10 @@ struct CacheWarmupCommand: ParsableCommand {
             warmedSlots.append(.searchField)
 
             if let recipient, !recipient.isEmpty {
+                let originalSearchText = searchField.stringValue ?? ""
+                defer {
+                    windowResolver.restoreSearchField(searchField, typedQuery: recipient, originalValue: originalSearchText)
+                }
                 _ = runner.focusWithVerification(searchField, label: "warmup search field", attempts: 1)
                 _ = runner.setTextWithVerification("", on: searchField, label: "warmup search clear", attempts: 1)
                 _ = runner.setTextWithVerification(recipient, on: searchField, label: "warmup search input", attempts: 1)
