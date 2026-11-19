@@ -1171,7 +1171,8 @@ struct TranscriptHistoryInfo: Sendable {
     let pagesLoaded: Int
     /// The transcript stopped growing when paged up, i.e. the conversation start is loaded.
     let oldestReached: Bool
-    /// Stopped by the page cap, the time budget, the message cap, or a disallowed page-up.
+    /// The range back to `since` was not fully covered (page cap, time budget,
+    /// disallowed page-up), or `limit` dropped older messages.
     let truncated: Bool
 }
 
@@ -1280,7 +1281,7 @@ extension KakaoTalkTranscriptReader {
                 }
                 continue
             }
-            if isOlderThanSince(analysis, sinceMinute: sinceMinute, referenceDate: referenceDate) {
+            if isOlderThanSince(analysis, sinceMinute: sinceMinute) {
                 crossedSince = true
             }
         }
@@ -1289,7 +1290,7 @@ extension KakaoTalkTranscriptReader {
         // Time labels sit on the last row of a same-minute group, so everything after
         // the newest row that is provably older than `since` belongs to `since` or later.
         let cutIndex = analyses.lastIndex(where: {
-            isOlderThanSince($0, sinceMinute: sinceMinute, referenceDate: referenceDate)
+            isOlderThanSince($0, sinceMinute: sinceMinute)
         })
         let indexed = buildMessages(
             from: analyses,
@@ -1310,9 +1311,12 @@ extension KakaoTalkTranscriptReader {
             limitHit = true
         }
 
-        let truncated = outcome.capped || deadlineHit || limitHit || (!allowPaging && !crossedSince)
+        // Covered when a row older than `since` was seen, or every loaded row was
+        // analyzed and the loaded rows reach back to the conversation start.
+        let covered = crossedSince || (outcome.oldestReached && !deadlineHit)
+        let truncated = limitHit || !covered
         runner.log(
-            "read-since: analyzed=\(analyses.count) messages=\(messages.count) crossed=\(crossedSince) deadlineHit=\(deadlineHit) limitHit=\(limitHit)"
+            "read-since: analyzed=\(analyses.count) messages=\(messages.count) crossed=\(crossedSince) deadlineHit=\(deadlineHit) limitHit=\(limitHit) pageCapped=\(outcome.capped)"
         )
 
         return TranscriptSinceSnapshot(
@@ -1330,13 +1334,13 @@ extension KakaoTalkTranscriptReader {
         )
     }
 
-    private func isOlderThanSince(_ analysis: RowAnalysis, sinceMinute: Date, referenceDate: Date) -> Bool {
+    /// Decided only from the row's own time label (AXHelp date + time), never from
+    /// message bodies, which may mention arbitrary dates.
+    private func isOlderThanSince(_ analysis: RowAnalysis, sinceMinute: Date) -> Bool {
         if let exact = TranscriptTime.localDate(date: analysis.axHelpDate, timeRaw: analysis.timeRaw) {
             return exact < sinceMinute
         }
-        guard let body = analysis.bodyCandidate?.body else { return false }
-        let separatorDay = TranscriptTime.separatorDay(body) ?? parseSystemDate(from: body, relativeTo: referenceDate)
-        return isWholeDayBefore(separatorDay, sinceMinute: sinceMinute)
+        return isWholeDayBefore(TranscriptTime.localDay(analysis.axHelpDate), sinceMinute: sinceMinute)
     }
 
     private func isWholeDayBefore(_ day: Date?, sinceMinute: Date) -> Bool {
@@ -1356,9 +1360,11 @@ extension KakaoTalkTranscriptReader {
         deadline: Date
     ) -> HistoryLoadOutcome {
         var outcome = HistoryLoadOutcome()
-        guard let scrollArea = enclosingScrollArea(of: table, transcriptRoot: transcriptRoot),
-              let scrollBarElement: AXUIElement = scrollArea.attributeOptional(kAXVerticalScrollBarAttribute)
-        else {
+        guard let scrollArea = enclosingScrollArea(of: table, transcriptRoot: transcriptRoot) else {
+            runner.log("read-since: transcript scroll area unavailable; reading loaded rows only")
+            return outcome
+        }
+        guard let scrollBarElement: AXUIElement = scrollArea.attributeOptional(kAXVerticalScrollBarAttribute) else {
             // Nothing to scroll: the whole conversation fits in the loaded rows.
             runner.log("read-since: no vertical scroll bar; treating loaded rows as complete")
             outcome.oldestReached = true

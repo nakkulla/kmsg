@@ -67,16 +67,18 @@ enum TranscriptTime {
         return calendar.date(byAdding: .minute, value: minute, to: day)
     }
 
-    /// Start of day for a date separator such as "2026년 11월 10일 월요일".
+    /// Start of day for a date separator label such as "2026년 11월 10일 월요일".
+    /// The whole label must match, so sentences that mention a date are ignored.
     static func separatorDay(_ text: String?, calendar: Calendar = .current) -> Date? {
-        guard let text else { return nil }
-        guard let match = text.range(
-            of: #"(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일"#,
-            options: .regularExpression
-        ) else {
+        guard let trimmed = text?.trimmingCharacters(in: .whitespacesAndNewlines),
+              trimmed.range(
+                  of: #"^(\d{4})년\s*(\d{1,2})월\s*(\d{1,2})일(?:\s+\S+요일)?$"#,
+                  options: .regularExpression
+              ) != nil
+        else {
             return nil
         }
-        let numbers = text[match].split(whereSeparator: { !$0.isNumber }).compactMap { Int($0) }
+        let numbers = trimmed.split(whereSeparator: { !$0.isNumber }).compactMap { Int($0) }
         guard numbers.count >= 3 else { return nil }
         return calendar.date(from: DateComponents(year: numbers[0], month: numbers[1], day: numbers[2]))
     }
