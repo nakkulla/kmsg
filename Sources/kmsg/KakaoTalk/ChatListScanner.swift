@@ -52,17 +52,35 @@ struct ChatListDiscovery {
     let title: String
     let lastMessage: String?
     let listIndex: Int
+    var unreadCount: Int? = nil
+    var unreadCountCapped: Bool = false
 }
 
-struct ChatListEntry: Codable, Equatable {
+struct ChatListEntry: Encodable, Equatable {
     let title: String
     let chatID: String?
     let lastMessage: String?
+    /// Unread badge count; nil when the row shows no badge.
+    let unreadCount: Int?
+    /// True when the badge was capped (e.g. "999+").
+    let unreadCountCapped: Bool
 
     enum CodingKeys: String, CodingKey {
         case title
         case chatID = "chat_id"
         case lastMessage = "last_message"
+        case unreadCount = "unread_count"
+        case unreadCountCapped = "unread_count_capped"
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(title, forKey: .title)
+        try container.encodeIfPresent(chatID, forKey: .chatID)
+        try container.encodeIfPresent(lastMessage, forKey: .lastMessage)
+        // Explicit null so consumers can tell "no badge" from an older kmsg build.
+        try container.encode(unreadCount, forKey: .unreadCount)
+        try container.encode(unreadCountCapped, forKey: .unreadCountCapped)
     }
 }
 
@@ -90,7 +108,14 @@ struct ChatListScanner {
         for (index, row) in rows.enumerated() {
             let title = extractTitle(from: row, trace: trace)
             let preview = extractPreview(from: row, title: title, trace: trace)
-            let discovery = ChatListDiscovery(title: title, lastMessage: preview, listIndex: index)
+            let badge = extractUnreadBadge(from: row)
+            let discovery = ChatListDiscovery(
+                title: title,
+                lastMessage: preview,
+                listIndex: index,
+                unreadCount: badge?.count,
+                unreadCountCapped: badge?.capped ?? false
+            )
             snapshots.append(ChatListSnapshotItem(element: row, discovery: discovery))
         }
 
@@ -231,6 +256,13 @@ struct ChatListScanner {
         }
 
         return nil
+    }
+
+    /// Reads the unread badge ("Count Label" static text) of a chat row.
+    private func extractUnreadBadge(from row: UIElement) -> (count: Int, capped: Bool)? {
+        let badges = row.findAll(where: { $0.identifier == "Count Label" }, limit: 1, maxNodes: 60)
+        guard let badge = badges.first else { return nil }
+        return UnreadBadgeParser.parse(badge.stringValue ?? badge.title)
     }
 
     private func titleText(from element: UIElement) -> String? {

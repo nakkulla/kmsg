@@ -184,6 +184,10 @@ private final class KmsgSubprocessRunner {
 }
 
 private final class KmsgMCPServer {
+    private static let sinceLimitMax = 2_000
+    private static let sinceTimeoutDefault = 180.0
+    private static let sinceTimeoutMax = 600.0
+
     private let protocolVersion = "2024-11-05"
     private let runner = KmsgSubprocessRunner()
     private let deepRecoveryDefault: Bool
@@ -303,13 +307,29 @@ private final class KmsgMCPServer {
         [
             [
                 "name": "kmsg_read",
-                "description": "Read recent KakaoTalk messages from a chat via kmsg.",
+                "description": "Read recent KakaoTalk messages from a chat via kmsg, or every message since a time with since.",
                 "inputSchema": [
                     "type": "object",
                     "properties": [
                         "chat": ["type": "string", "description": "Chat room or user name"],
                         "chat_id": ["type": "string", "description": "Synthetic chat_id from kmsg chats"],
-                        "limit": ["type": "integer", "minimum": 1, "maximum": 100, "default": 20],
+                        "limit": [
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 2000,
+                            "description": "Maximum messages. Without since: 1..100, default 20. With since: safety cap 1..2000, default 2000.",
+                        ],
+                        "since": [
+                            "type": "string",
+                            "description": "Return every message at or after this time: ISO 8601 (2026-11-18T07:00:00+09:00; local time without offset) or relative (90m, 24h, 2d). Pages older history in the chat window.",
+                        ],
+                        "timeout_sec": [
+                            "type": "integer",
+                            "minimum": 10,
+                            "maximum": 600,
+                            "default": 180,
+                            "description": "Only with since: time budget in seconds for the read process.",
+                        ],
                         "deep_recovery": [
                             "type": "boolean",
                             "default": deepRecoveryDefault,
@@ -468,14 +488,51 @@ private final class KmsgMCPServer {
             return errorPayload(
                 code: "INVALID_ARGUMENT",
                 message: "limit must be an integer",
-                hint: "Use integer range 1..100 for limit.",
+                hint: "Use integer range 1..100 for limit (1..2000 with since).",
                 rawStdout: "",
                 rawStderr: "",
                 latencyMs: 0
             )
         }
 
-        let boundedLimit = max(1, min(limit, 100))
+        let since = String(describing: arguments["since"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        let sinceMode = !since.isEmpty
+        if sinceMode && SinceParser.parse(since) == nil {
+            return errorPayload(
+                code: "INVALID_ARGUMENT",
+                message: "since must be ISO 8601 or a relative span",
+                hint: "Use e.g. since=2026-11-18T07:00:00+09:00, since=24h, since=90m, or since=2d.",
+                rawStdout: "",
+                rawStderr: "",
+                latencyMs: 0
+            )
+        }
+
+        let sinceTimeoutSec: Double
+        if let intValue = arguments["timeout_sec"] as? Int {
+            sinceTimeoutSec = Double(intValue)
+        } else if let doubleValue = arguments["timeout_sec"] as? Double {
+            sinceTimeoutSec = doubleValue
+        } else if arguments["timeout_sec"] == nil {
+            sinceTimeoutSec = Self.sinceTimeoutDefault
+        } else {
+            return errorPayload(
+                code: "INVALID_ARGUMENT",
+                message: "timeout_sec must be an integer",
+                hint: "Use integer range 10..600 for timeout_sec.",
+                rawStdout: "",
+                rawStderr: "",
+                latencyMs: 0
+            )
+        }
+        let boundedSinceTimeoutSec = max(10.0, min(sinceTimeoutSec, Self.sinceTimeoutMax))
+
+        let boundedLimit: Int
+        if sinceMode {
+            boundedLimit = max(1, min(rawLimit == nil ? Self.sinceLimitMax : limit, Self.sinceLimitMax))
+        } else {
+            boundedLimit = max(1, min(limit, 100))
+        }
         let deepRecovery = boolValue(arguments["deep_recovery"], defaultValue: deepRecoveryDefault)
         let backgroundSafe = boolValue(arguments["background_safe"], defaultValue: backgroundSafeDefault)
         let keepWindow = boolValue(arguments["keep_window"], defaultValue: false)
@@ -498,19 +555,27 @@ private final class KmsgMCPServer {
             command.append(chat)
         }
         command.append(contentsOf: ["--json", "--limit", String(boundedLimit), "--layout", layout])
+        if sinceMode {
+            // The child stops paging/analysis before the parent kills it, so it can
+            // still restore the scroll position, close the window, and print JSON.
+            let childBudget = max(5.0, boundedSinceTimeoutSec - min(15.0, boundedSinceTimeoutSec * 0.2))
+            command.append(contentsOf: ["--since", since, "--timeout-sec", String(Int(childBudget))])
+        }
         if deepRecovery { command.append("--deep-recovery") }
         if backgroundSafe { command.append("--background-safe") }
         if keepWindow { command.append("--keep-window") }
         if traceAX { command.append("--trace-ax") }
 
-        let timeoutSec = deepRecovery ? 15.0 : 8.0
+        let timeoutSec = sinceMode ? boundedSinceTimeoutSec : (deepRecovery ? 15.0 : 8.0)
         var first = runner.run(command, timeoutSec: timeoutSec)
 
         if first.timedOut {
             return errorPayload(
                 code: "PROCESS_TIMEOUT",
                 message: "kmsg read timed out",
-                hint: "Increase stability (keep KakaoTalk open/focused) and retry.",
+                hint: sinceMode
+                    ? "Increase timeout_sec or use a later since, then retry."
+                    : "Increase stability (keep KakaoTalk open/focused) and retry.",
                 rawStdout: first.stdout,
                 rawStderr: first.stderr,
                 latencyMs: first.latencyMs
@@ -523,7 +588,7 @@ private final class KmsgMCPServer {
             if code == "CHAT_NOT_FOUND" && !deepRecovery && !backgroundSafe {
                 var retryCommand = command
                 retryCommand.append("--deep-recovery")
-                let retry = runner.run(retryCommand, timeoutSec: 15.0)
+                let retry = runner.run(retryCommand, timeoutSec: sinceMode ? boundedSinceTimeoutSec : 15.0)
                 if retry.returncode == 0 && !retry.timedOut {
                     first = retry
                 } else {
@@ -572,6 +637,14 @@ private final class KmsgMCPServer {
                 "background_safe": backgroundSafe,
             ],
         ]
+        if sinceMode {
+            var meta = response["meta"] as? JSONDict ?? [:]
+            meta["since"] = payload["since"] ?? since
+            meta["oldest_reached"] = payload["oldest_reached"] ?? false
+            meta["truncated"] = payload["truncated"] ?? false
+            meta["pages_loaded"] = payload["pages_loaded"] ?? 0
+            response["meta"] = meta
+        }
         if traceAX, !first.stderr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             var meta = response["meta"] as? JSONDict ?? [:]
             meta["stderr_trace"] = first.stderr

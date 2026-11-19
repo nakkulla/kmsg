@@ -9,14 +9,27 @@ struct ReadCommand: ParsableCommand {
         let fetchedAt: String
         let count: Int
         let messages: [TranscriptMessage]
+        // Present only for --since reads.
+        let since: String?
+        let oldestReached: Bool?
+        let truncated: Bool?
+        let pagesLoaded: Int?
 
         enum CodingKeys: String, CodingKey {
             case chat
             case fetchedAt = "fetched_at"
             case count
             case messages
+            case since
+            case oldestReached = "oldest_reached"
+            case truncated
+            case pagesLoaded = "pages_loaded"
         }
     }
+
+    static let defaultLimit = 20
+    static let defaultSinceLimit = 2_000
+    static let defaultSinceTimeoutSec = 180.0
 
     static let configuration = CommandConfiguration(
         commandName: "read",
@@ -29,6 +42,13 @@ struct ReadCommand: ParsableCommand {
             Use --background-safe to read only already exposed chat windows without launching,
             activating, logging in, searching, opening rows, resizing, or closing windows.
 
+            Use --since to read every message at or after a time instead of the latest N:
+              kmsg read --chat-id <chat-id> --since 2026-11-18T07:00:00+09:00 --json
+              kmsg read <chat> --since 24h
+            --since pages older history into the chat window (up to --max-pages) and
+            stops at --timeout-sec; --limit then only caps the result (default 2000).
+            With --background-safe, --since reads only already loaded rows.
+
             When author is "(me)", the message was sent by you.
             """
     )
@@ -39,8 +59,17 @@ struct ReadCommand: ParsableCommand {
     @Argument(help: "Name of the chat to read from (partial match supported)")
     var chat: String?
 
-    @Option(name: .shortAndLong, help: "Maximum number of messages to show")
-    var limit: Int = 20
+    @Option(name: .shortAndLong, help: "Maximum number of messages to show (default 20; with --since, a safety cap, default 2000)")
+    var limit: Int?
+
+    @Option(name: .long, help: "Read all messages at or after this time: ISO 8601 (2026-11-18T07:00:00+09:00, local time without offset) or relative (90m, 24h, 2d)")
+    var since: String?
+
+    @Option(name: .long, help: "With --since, maximum number of older-history pages (~50 rows each) to load")
+    var maxPages: Int = 40
+
+    @Option(name: .long, help: "With --since, overall time budget in seconds; returns truncated results when exceeded")
+    var timeoutSec: Double = ReadCommand.defaultSinceTimeoutSec
 
     @Flag(name: .long, help: "Show raw element info for debugging")
     var debug: Bool = false
@@ -73,6 +102,19 @@ struct ReadCommand: ParsableCommand {
     var json: Bool = false
 
     func validate() throws {
+        if let limit, limit < 1 {
+            throw ValidationError("--limit must be at least 1.")
+        }
+        if let since, SinceParser.parse(since) == nil {
+            throw ValidationError("--since must be ISO 8601 (e.g. 2026-11-18T07:00:00+09:00) or relative (90m, 24h, 2d).")
+        }
+        if maxPages < 0 {
+            throw ValidationError("--max-pages must be 0 or greater.")
+        }
+        if timeoutSec <= 0 {
+            throw ValidationError("--timeout-sec must be greater than 0.")
+        }
+
         if let chatID, !chatID.isEmpty {
             guard chat == nil else {
                 throw ValidationError("Chat name cannot be provided together with --chat-id.")
@@ -86,6 +128,7 @@ struct ReadCommand: ParsableCommand {
     }
 
     func run() throws {
+        let startedAt = Date()
         guard AccessibilityPermission.ensureGranted() else {
             AccessibilityPermission.printInstructions()
             throw ExitCode.failure
@@ -165,13 +208,29 @@ struct ReadCommand: ParsableCommand {
             }
         }
 
+        let sinceDate = since.flatMap { SinceParser.parse($0, now: startedAt) }
         let snapshot: TranscriptSnapshot
+        var history: TranscriptHistoryInfo?
         do {
-            snapshot = try transcriptReader.readSnapshot(
-                from: window,
-                fallbackChatTitle: window.title ?? requestedChat,
-                limit: limit
-            )
+            if let sinceDate {
+                let result = try transcriptReader.readSince(
+                    from: window,
+                    fallbackChatTitle: window.title ?? requestedChat,
+                    since: sinceDate,
+                    limit: limit ?? Self.defaultSinceLimit,
+                    maxPages: maxPages,
+                    deadline: startedAt.addingTimeInterval(timeoutSec),
+                    allowPaging: !backgroundSafe
+                )
+                snapshot = result.snapshot
+                history = result.history
+            } else {
+                snapshot = try transcriptReader.readSnapshot(
+                    from: window,
+                    fallbackChatTitle: window.title ?? requestedChat,
+                    limit: limit ?? Self.defaultLimit
+                )
+            }
         } catch TranscriptReadError.transcriptContextUnavailable {
             print("Could not locate chat transcript area.")
             print("Use 'kmsg inspect --window <n>' to inspect the opened chat window.")
@@ -187,12 +246,17 @@ struct ReadCommand: ParsableCommand {
         }
 
         if json {
-            try printMessagesAsJSON(snapshot)
+            try printMessagesAsJSON(snapshot, history: history)
             return
         }
 
         print("Reading messages from: \(snapshot.chat)\n")
-        print("Recent messages (\(snapshot.count)):\n")
+        if let history {
+            print("Messages since \(SinceParser.format(history.since)) (\(snapshot.count)):")
+            print("pages_loaded: \(history.pagesLoaded), oldest_reached: \(history.oldestReached), truncated: \(history.truncated)\n")
+        } else {
+            print("Recent messages (\(snapshot.count)):\n")
+        }
         for (index, message) in snapshot.messages.enumerated() {
             if debug {
                 print("[\(index + 1)] author=\(message.author ?? "(me)") time=\(message.timeRaw ?? "unknown") body=\(message.body)")
@@ -206,7 +270,7 @@ struct ReadCommand: ParsableCommand {
         }
     }
 
-    private func printMessagesAsJSON(_ snapshot: TranscriptSnapshot) throws {
+    private func printMessagesAsJSON(_ snapshot: TranscriptSnapshot, history: TranscriptHistoryInfo?) throws {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
 
@@ -214,7 +278,11 @@ struct ReadCommand: ParsableCommand {
             chat: snapshot.chat,
             fetchedAt: formatter.string(from: snapshot.fetchedAt),
             count: snapshot.count,
-            messages: snapshot.messages
+            messages: snapshot.messages,
+            since: history.map { SinceParser.format($0.since) },
+            oldestReached: history?.oldestReached,
+            truncated: history?.truncated,
+            pagesLoaded: history?.pagesLoaded
         )
 
         let encoder = JSONEncoder()

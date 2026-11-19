@@ -2,7 +2,7 @@ import ArgumentParser
 import Foundation
 
 struct ChatsCommand: ParsableCommand {
-    private struct ChatsJSONResponse: Codable {
+    private struct ChatsJSONResponse: Encodable {
         let count: Int
         let chats: [ChatListEntry]
     }
@@ -94,7 +94,9 @@ struct ChatsCommand: ParsableCommand {
             ChatListEntry(
                 title: snapshot.discovery.title,
                 chatID: chatID.isEmpty ? nil : chatID,
-                lastMessage: snapshot.discovery.lastMessage
+                lastMessage: snapshot.discovery.lastMessage,
+                unreadCount: snapshot.discovery.unreadCount,
+                unreadCountCapped: snapshot.discovery.unreadCountCapped
             )
         }
         if json {
@@ -106,7 +108,11 @@ struct ChatsCommand: ParsableCommand {
         print("Found \(chats.count) chat(s):\n")
 
         for (index, chat) in chats.enumerated() {
-            print("[\(index + 1)] \(chat.title)")
+            if let unread = chat.unreadCount {
+                print("[\(index + 1)] \(chat.title) (\(unread)\(chat.unreadCountCapped ? "+" : ""))")
+            } else {
+                print("[\(index + 1)] \(chat.title)")
+            }
             print("    chat_id: \(chat.chatID ?? "unavailable")")
             if verbose, let msg = chat.lastMessage {
                 print("    └─ \(msg)")

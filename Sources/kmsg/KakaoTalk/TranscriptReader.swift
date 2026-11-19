@@ -251,7 +251,33 @@ struct KakaoTalkTranscriptReader {
             analyzeRow($0, transcriptRoot: transcriptRoot, referenceDate: referenceDate, frameCache: frameCache)
         }
 
-        var messages: [TranscriptMessage] = []
+        var messages = buildMessages(
+            from: analyses,
+            limit: limit,
+            includeSystemMessages: includeSystemMessages,
+            referenceDate: referenceDate
+        ).map(\.message)
+
+        runner.log("read: row parser messages=\(messages.count)")
+
+        if messages.isEmpty || messages.count < max(3, min(limit / 2, 8)) {
+            let fallback = extractFallbackMessages(from: transcriptRoot, limit: limit, referenceDate: referenceDate)
+            runner.log("read: fallback messages=\(fallback.count)")
+            messages.append(contentsOf: fallback)
+        }
+
+        return Array(deduplicateMessagesPreservingOrder(messages).suffix(limit))
+    }
+
+    /// Forward pass that turns row analyses (oldest first) into messages, carrying
+    /// author/time/date anchors across rows. Each message keeps its analysis index.
+    private func buildMessages(
+        from analyses: [RowAnalysis],
+        limit: Int,
+        includeSystemMessages: Bool,
+        referenceDate: Date
+    ) -> [IndexedTranscriptMessage] {
+        var messages: [IndexedTranscriptMessage] = []
         messages.reserveCapacity(min(analyses.count, limit * 2))
         var selectedLogs = 0
         var skippedLogs = 0
@@ -320,7 +346,7 @@ struct KakaoTalkTranscriptReader {
                     logicalTimestamp: currentDateAnchor,
                     date: resolvedDate
                 )
-                messages.append(message)
+                messages.append(IndexedTranscriptMessage(analysisIndex: offset, message: message))
                 continue
             }
 
@@ -359,7 +385,7 @@ struct KakaoTalkTranscriptReader {
                 ),
                 date: resolvedDate
             )
-            messages.append(message)
+            messages.append(IndexedTranscriptMessage(analysisIndex: offset, message: message))
             if selectedLogs < 10 {
                 runner.log(
                     "read: row[\(offset + 1)] side=\(side.rawValue) author='\(author ?? "(me)")' source=\(resolvedAuthor.source) time='\(resolvedTime ?? "unknown")' body='\(bodyCandidate.body.prefix(60))'"
@@ -368,15 +394,7 @@ struct KakaoTalkTranscriptReader {
             }
         }
 
-        runner.log("read: row parser messages=\(messages.count)")
-
-        if messages.isEmpty || messages.count < max(3, min(limit / 2, 8)) {
-            let fallback = extractFallbackMessages(from: transcriptRoot, limit: limit, referenceDate: referenceDate)
-            runner.log("read: fallback messages=\(fallback.count)")
-            messages.append(contentsOf: fallback)
-        }
-
-        return Array(deduplicateMessagesPreservingOrder(messages).suffix(limit))
+        return messages
     }
 
     private func directRowChildren(from element: UIElement) -> [UIElement] {
@@ -876,49 +894,7 @@ struct KakaoTalkTranscriptReader {
     }
 
     private func minuteOfDay(from timeRaw: String?) -> Int? {
-        guard let timeRaw else { return nil }
-        let trimmed = timeRaw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-
-        if let meridiemRange = trimmed.range(
-            of: #"(오전|오후)\s*([1-9]|1[0-2]):([0-5][0-9])"#,
-            options: .regularExpression
-        ) {
-            let token = String(trimmed[meridiemRange])
-                .replacingOccurrences(of: "오전", with: "")
-                .replacingOccurrences(of: "오후", with: "")
-                .trimmingCharacters(in: .whitespaces)
-            let parts = token.split(separator: ":")
-            guard parts.count == 2,
-                  let hourPart = Int(parts[0]),
-                  let minutePart = Int(parts[1])
-            else {
-                return nil
-            }
-
-            var hour = hourPart % 12
-            if trimmed.contains("오후") {
-                hour += 12
-            }
-            return hour * 60 + minutePart
-        }
-
-        if let range = trimmed.range(
-            of: #"([01]?[0-9]|2[0-3]):([0-5][0-9])"#,
-            options: .regularExpression
-        ) {
-            let token = String(trimmed[range])
-            let parts = token.split(separator: ":")
-            guard parts.count == 2,
-                  let hour = Int(parts[0]),
-                  let minute = Int(parts[1])
-            else {
-                return nil
-            }
-            return hour * 60 + minute
-        }
-
-        return nil
+        TranscriptTime.minuteOfDay(from: timeRaw)
     }
 
     private func logicalTimestamp(for timeRaw: String?, dateAnchor: Date?, referenceDate: Date) -> Date? {
@@ -1188,8 +1164,389 @@ struct KakaoTalkTranscriptReader {
     }
 }
 
+// MARK: - Time-bounded read (`read --since`)
+
+struct TranscriptHistoryInfo: Sendable {
+    let since: Date
+    let pagesLoaded: Int
+    /// The transcript stopped growing when paged up, i.e. the conversation start is loaded.
+    let oldestReached: Bool
+    /// Stopped by the page cap, the time budget, the message cap, or a disallowed page-up.
+    let truncated: Bool
+}
+
+struct TranscriptSinceSnapshot: Sendable {
+    let snapshot: TranscriptSnapshot
+    let history: TranscriptHistoryInfo
+}
+
+private enum LoadedEdgeTime {
+    case exact(Date)
+    case day(Date)
+}
+
+private struct HistoryLoadOutcome {
+    var pagesLoaded = 0
+    var oldestReached = false
+    var capped = false
+}
+
+extension KakaoTalkTranscriptReader {
+    private static let pageGrowthTimeout: TimeInterval = 3.0
+    private static let pagePollInterval: TimeInterval = 0.15
+    private static let peekRowCount = 12
+    private static let anchorContextRows = 8
+
+    /// Reads every message at or after `since`, paging older history into the
+    /// transcript table first. Messages are returned oldest first; at most `limit`
+    /// (newest) are kept.
+    func readSince(
+        from window: UIElement,
+        fallbackChatTitle: String,
+        since: Date,
+        limit: Int,
+        maxPages: Int,
+        deadline: Date,
+        allowPaging: Bool
+    ) throws -> TranscriptSinceSnapshot {
+        let referenceDate = Date()
+        let sinceMinute = TranscriptTime.minuteFloor(since)
+        let messageContextResolver = MessageContextResolver(
+            kakao: kakao,
+            runner: runner,
+            interactionMode: interactionMode
+        )
+        guard let context = messageContextResolver.resolve(in: window) else {
+            throw TranscriptReadError.transcriptContextUnavailable
+        }
+
+        let table = transcriptTable(in: context.transcriptRoot)
+        var outcome = HistoryLoadOutcome()
+        if allowPaging, let table {
+            // Leave half of the remaining budget for row analysis, which dominates the cost.
+            let pagingDeadline = Date().addingTimeInterval(max(0, deadline.timeIntervalSinceNow) / 2)
+            outcome = loadHistory(
+                table: table,
+                transcriptRoot: context.transcriptRoot,
+                sinceMinute: sinceMinute,
+                maxPages: maxPages,
+                deadline: pagingDeadline
+            )
+        } else if allowPaging {
+            runner.log("read-since: transcript table unavailable; reading loaded rows only")
+        }
+
+        let frameCache = FrameCache()
+        let rows: [UIElement]
+        if let table {
+            rows = orderedRows(of: table, frameCache: frameCache)
+        } else {
+            rows = collectTranscriptRows(
+                from: context.transcriptRoot,
+                inputElement: context.inputElement,
+                messageLimit: 20,
+                frameCache: frameCache
+            )
+        }
+        guard !rows.isEmpty else {
+            throw TranscriptReadError.noMessageRows
+        }
+        runner.log("read-since: rows=\(rows.count) pages=\(outcome.pagesLoaded) oldestReached=\(outcome.oldestReached)")
+
+        // Analyze newest first and stop once a row is provably older than `since`,
+        // then a few more rows so the forward pass has an author anchor.
+        let inputMinY = context.inputElement.frame?.minY
+        var reversedAnalyses: [RowAnalysis] = []
+        var crossedSince = false
+        var contextRows = 0
+        var deadlineHit = false
+        for row in rows.reversed() {
+            if crossedSince, contextRows >= Self.anchorContextRows {
+                break
+            }
+            if Date() >= deadline {
+                deadlineHit = true
+                break
+            }
+            if let inputMinY, let rowFrame = frameCache.frame(of: row), rowFrame.maxY > inputMinY + 20 {
+                continue
+            }
+            let analysis = analyzeRow(row, transcriptRoot: context.transcriptRoot, referenceDate: referenceDate, frameCache: frameCache)
+            reversedAnalyses.append(analysis)
+            if crossedSince {
+                contextRows += 1
+                if analysis.explicitAuthor != nil {
+                    break
+                }
+                continue
+            }
+            if isOlderThanSince(analysis, sinceMinute: sinceMinute, referenceDate: referenceDate) {
+                crossedSince = true
+            }
+        }
+
+        let analyses = Array(reversedAnalyses.reversed())
+        // Time labels sit on the last row of a same-minute group, so everything after
+        // the newest row that is provably older than `since` belongs to `since` or later.
+        let cutIndex = analyses.lastIndex(where: {
+            isOlderThanSince($0, sinceMinute: sinceMinute, referenceDate: referenceDate)
+        })
+        let indexed = buildMessages(
+            from: analyses,
+            limit: limit,
+            includeSystemMessages: false,
+            referenceDate: referenceDate
+        )
+        var messages = indexed
+            .filter { entry in
+                guard let cutIndex else { return true }
+                return entry.analysisIndex > cutIndex
+            }
+            .map(\.message)
+
+        var limitHit = false
+        if messages.count > limit {
+            messages = Array(messages.suffix(limit))
+            limitHit = true
+        }
+
+        let truncated = outcome.capped || deadlineHit || limitHit || (!allowPaging && !crossedSince)
+        runner.log(
+            "read-since: analyzed=\(analyses.count) messages=\(messages.count) crossed=\(crossedSince) deadlineHit=\(deadlineHit) limitHit=\(limitHit)"
+        )
+
+        return TranscriptSinceSnapshot(
+            snapshot: TranscriptSnapshot(
+                chat: window.title ?? fallbackChatTitle,
+                fetchedAt: referenceDate,
+                messages: messages
+            ),
+            history: TranscriptHistoryInfo(
+                since: since,
+                pagesLoaded: outcome.pagesLoaded,
+                oldestReached: outcome.oldestReached,
+                truncated: truncated
+            )
+        )
+    }
+
+    private func isOlderThanSince(_ analysis: RowAnalysis, sinceMinute: Date, referenceDate: Date) -> Bool {
+        if let exact = TranscriptTime.localDate(date: analysis.axHelpDate, timeRaw: analysis.timeRaw) {
+            return exact < sinceMinute
+        }
+        guard let body = analysis.bodyCandidate?.body else { return false }
+        let separatorDay = TranscriptTime.separatorDay(body) ?? parseSystemDate(from: body, relativeTo: referenceDate)
+        return isWholeDayBefore(separatorDay, sinceMinute: sinceMinute)
+    }
+
+    private func isWholeDayBefore(_ day: Date?, sinceMinute: Date) -> Bool {
+        guard let day, let nextDay = Calendar.current.date(byAdding: .day, value: 1, to: day) else {
+            return false
+        }
+        return nextDay <= sinceMinute
+    }
+
+    // MARK: Paging
+
+    private func loadHistory(
+        table: UIElement,
+        transcriptRoot: UIElement,
+        sinceMinute: Date,
+        maxPages: Int,
+        deadline: Date
+    ) -> HistoryLoadOutcome {
+        var outcome = HistoryLoadOutcome()
+        guard let scrollArea = enclosingScrollArea(of: table, transcriptRoot: transcriptRoot),
+              let scrollBarElement: AXUIElement = scrollArea.attributeOptional(kAXVerticalScrollBarAttribute)
+        else {
+            // Nothing to scroll: the whole conversation fits in the loaded rows.
+            runner.log("read-since: no vertical scroll bar; treating loaded rows as complete")
+            outcome.oldestReached = true
+            return outcome
+        }
+        let scrollBar = UIElement(scrollBarElement)
+        guard var rowCount = rowCount(of: table), rowCount > 0 else {
+            runner.log("read-since: row count unavailable; skipping page-up")
+            outcome.capped = true
+            return outcome
+        }
+
+        var scrolled = false
+        defer {
+            if scrolled {
+                scrollToBottom(scrollBar)
+            }
+        }
+
+        while true {
+            if let edge = peekOldestLoadedTime(in: table), isEdgeOlder(edge, sinceMinute: sinceMinute) {
+                runner.log("read-since: oldest loaded row is older than since after \(outcome.pagesLoaded) page(s)")
+                break
+            }
+            if outcome.pagesLoaded >= maxPages || Date() >= deadline {
+                runner.log("read-since: page cap reached pages=\(outcome.pagesLoaded)")
+                outcome.capped = true
+                break
+            }
+
+            do {
+                try scrollBar.setAttribute(kAXValueAttribute, value: NSNumber(value: 0.0))
+                scrolled = true
+            } catch {
+                runner.log("read-since: failed to scroll transcript up: \(error)")
+                outcome.capped = true
+                break
+            }
+
+            let waitUntil = min(Date().addingTimeInterval(Self.pageGrowthTimeout), deadline)
+            var grownCount: Int?
+            var lastObserved: Int?
+            while Date() < waitUntil {
+                Thread.sleep(forTimeInterval: Self.pagePollInterval)
+                lastObserved = self.rowCount(of: table)
+                if let observed = lastObserved, observed > rowCount {
+                    grownCount = observed
+                    break
+                }
+            }
+
+            guard let grownCount else {
+                if let lastObserved, lastObserved > 0 {
+                    runner.log("read-since: row count stayed at \(lastObserved); conversation start reached")
+                    outcome.oldestReached = true
+                } else {
+                    runner.log("read-since: row count unreadable while paging; stopping")
+                    outcome.capped = true
+                }
+                break
+            }
+
+            outcome.pagesLoaded += 1
+            runner.log("read-since: page \(outcome.pagesLoaded) rows \(rowCount) -> \(grownCount)")
+            rowCount = grownCount
+        }
+
+        return outcome
+    }
+
+    private func scrollToBottom(_ scrollBar: UIElement) {
+        do {
+            try scrollBar.setAttribute(kAXValueAttribute, value: NSNumber(value: 1.0))
+        } catch {
+            runner.log("read-since: failed to restore scroll position: \(error)")
+            return
+        }
+        let settleUntil = Date().addingTimeInterval(2.0)
+        repeat {
+            Thread.sleep(forTimeInterval: 0.2)
+            if let value = scrollBar.value as? NSNumber, value.doubleValue >= 0.99 {
+                break
+            }
+        } while Date() < settleUntil
+    }
+
+    private func isEdgeOlder(_ edge: LoadedEdgeTime, sinceMinute: Date) -> Bool {
+        switch edge {
+        case let .exact(date):
+            return date < sinceMinute
+        case let .day(day):
+            return isWholeDayBefore(day, sinceMinute: sinceMinute)
+        }
+    }
+
+    /// Cheap look at the oldest loaded rows: only time labels (AXHelp date + time)
+    /// and date separators, no body analysis.
+    private func peekOldestLoadedTime(in table: UIElement) -> LoadedEdgeTime? {
+        guard let rows = tableRows(of: table) else { return nil }
+        let ordered = isReversedOrder(rows, frameCache: FrameCache()) ? Array(rows.reversed()) : rows
+        for row in ordered.prefix(Self.peekRowCount) {
+            var separatorDay: Date?
+            for text in row.findAll(role: kAXStaticTextRole, limit: 10, maxNodes: 60) {
+                let value = text.stringValue
+                if let help = text.helpText, let date = Self.parseHelpDate(help) {
+                    if let exact = TranscriptTime.localDate(date: date, timeRaw: value.flatMap(extractTimeToken)) {
+                        return .exact(exact)
+                    }
+                    if separatorDay == nil {
+                        separatorDay = TranscriptTime.localDay(date)
+                    }
+                }
+                if separatorDay == nil, let day = TranscriptTime.separatorDay(value) {
+                    separatorDay = day
+                }
+            }
+            if let separatorDay {
+                return .day(separatorDay)
+            }
+        }
+        return nil
+    }
+
+    // MARK: Table access
+
+    private func transcriptTable(in transcriptRoot: UIElement) -> UIElement? {
+        if transcriptRoot.role == kAXTableRole {
+            return transcriptRoot
+        }
+        return transcriptRoot.findAll(role: kAXTableRole, limit: 1, maxNodes: 200).first
+    }
+
+    private func enclosingScrollArea(of table: UIElement, transcriptRoot: UIElement) -> UIElement? {
+        var cursor: UIElement? = table
+        for _ in 0..<4 {
+            guard let current = cursor else { break }
+            if current.role == kAXScrollAreaRole {
+                return current
+            }
+            cursor = current.parent
+        }
+        if transcriptRoot.role == kAXScrollAreaRole {
+            return transcriptRoot
+        }
+        return transcriptRoot.findAll(role: kAXScrollAreaRole, limit: 1, maxNodes: 200).first
+    }
+
+    private func rowCount(of table: UIElement) -> Int? {
+        var count: CFIndex = 0
+        let error = AXUIElementGetAttributeValueCount(table.axElement, kAXRowsAttribute as CFString, &count)
+        if error == .success {
+            return count
+        }
+        return tableRows(of: table)?.count
+    }
+
+    private func tableRows(of table: UIElement) -> [UIElement]? {
+        if let axRows: [AXUIElement] = table.attributeOptional(kAXRowsAttribute) {
+            return axRows.map { UIElement($0) }
+        }
+        let rows = directRowChildren(from: table)
+        return rows.isEmpty ? nil : rows
+    }
+
+    /// Rows in visual (top-to-bottom) order without sorting every row by frame.
+    private func orderedRows(of table: UIElement, frameCache: FrameCache) -> [UIElement] {
+        guard let rows = tableRows(of: table) else { return [] }
+        return isReversedOrder(rows, frameCache: frameCache) ? Array(rows.reversed()) : rows
+    }
+
+    private func isReversedOrder(_ rows: [UIElement], frameCache: FrameCache) -> Bool {
+        guard rows.count > 1,
+              let first = frameCache.frame(of: rows[0]),
+              let last = frameCache.frame(of: rows[rows.count - 1])
+        else {
+            return false
+        }
+        return first.minY > last.minY
+    }
+}
+
 func messageFingerprint(_ message: TranscriptMessage) -> String {
     "\(message.author ?? "")\u{1F}\(message.timeRaw ?? "")\u{1F}\(message.body)"
+}
+
+private struct IndexedTranscriptMessage {
+    let analysisIndex: Int
+    let message: TranscriptMessage
 }
 
 private struct RowMetadata {
