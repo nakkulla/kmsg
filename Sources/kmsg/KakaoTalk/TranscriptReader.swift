@@ -70,6 +70,23 @@ struct TranscriptMessage: Encodable, Equatable, Sendable {
     }
 }
 
+extension TranscriptMessage {
+    /// Copy with `date`/`time_raw` replaced when a value is given.
+    func withDateTime(date: String?, timeRaw: String?) -> TranscriptMessage {
+        TranscriptMessage(
+            author: author,
+            timeRaw: timeRaw ?? self.timeRaw,
+            body: body,
+            imageCount: imageCount,
+            linkCount: linkCount,
+            attachmentCount: attachmentCount,
+            isSystem: isSystem,
+            logicalTimestamp: logicalTimestamp,
+            date: date ?? self.date
+        )
+    }
+}
+
 struct TranscriptSnapshot: Sendable {
     let chat: String
     let fetchedAt: Date
@@ -1333,12 +1350,23 @@ extension KakaoTalkTranscriptReader {
             includeSystemMessages: false,
             referenceDate: referenceDate
         )
-        var messages = indexed
-            .filter { entry in
-                guard let cutIndex else { return true }
-                return entry.analysisIndex > cutIndex
+        let firstKept = cutIndex.map { $0 + 1 } ?? 0
+        let ownLabels = resolveOwnLabels(analyses, from: firstKept)
+        var droppedBeforeSince = 0
+        var messages: [TranscriptMessage] = []
+        for entry in indexed where entry.analysisIndex >= firstKept {
+            let label = ownLabels[entry.analysisIndex]
+            if let label, let timestamp = TranscriptTime.localDate(date: label.date, timeRaw: label.time),
+               timestamp < sinceMinute
+            {
+                droppedBeforeSince += 1
+                continue
             }
-            .map(\.message)
+            messages.append(entry.message.withDateTime(date: label?.date, timeRaw: label?.time))
+        }
+        if droppedBeforeSince > 0 {
+            runner.log("read-since: dropped \(droppedBeforeSince) message(s) resolved before since")
+        }
 
         var limitHit = false
         if messages.count > limit {
@@ -1367,6 +1395,35 @@ extension KakaoTalkTranscriptReader {
                 truncated: truncated
             )
         )
+    }
+
+    /// Date and time for each analysis at or after `start`, from own time labels only.
+    /// KakaoTalk shows the time on the last bubble of a same-minute group, so an
+    /// unlabelled row takes the nearest newer labelled row; rows after the last label
+    /// take the nearest older label at or after `start` (never one across the cut).
+    private func resolveOwnLabels(_ analyses: [RowAnalysis], from start: Int) -> [Int: (date: String, time: String)] {
+        guard start < analyses.count else { return [:] }
+        var resolved: [Int: (date: String, time: String)] = [:]
+        var newer: (date: String, time: String)?
+        for index in stride(from: analyses.count - 1, through: start, by: -1) {
+            if let date = analyses[index].labelDate, let time = analyses[index].labelTime {
+                newer = (date, time)
+            }
+            if let newer {
+                resolved[index] = newer
+            }
+        }
+        var older: (date: String, time: String)?
+        for index in start..<analyses.count {
+            if let label = resolved[index] {
+                if analyses[index].labelTime != nil {
+                    older = label
+                }
+            } else if let older {
+                resolved[index] = older
+            }
+        }
+        return resolved
     }
 
     private func isWholeDayBefore(_ day: Date?, sinceMinute: Date) -> Bool {

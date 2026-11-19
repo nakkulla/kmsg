@@ -90,6 +90,14 @@ class ReadSinceContractTests(unittest.TestCase):
         self.assertIn("if let edge = labelled.max()", reader)
         self.assertIn("ownLabel=", reader)
 
+    def test_since_messages_take_date_and_time_from_own_labels(self) -> None:
+        reader = TRANSCRIPT_READER.read_text(encoding="utf-8")
+
+        self.assertIn("private func resolveOwnLabels(", reader)
+        self.assertIn("entry.analysisIndex >= firstKept", reader)
+        self.assertIn("timestamp < sinceMinute", reader)
+        self.assertIn("entry.message.withDateTime(date: label?.date, timeRaw: label?.time)", reader)
+
 
 class MCPReadSinceContractTests(unittest.TestCase):
     def test_mcp_read_schema_exposes_since_and_timeout(self) -> None:

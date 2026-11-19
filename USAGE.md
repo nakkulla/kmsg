@@ -235,7 +235,10 @@ half of `--timeout-sec` is used. It then scrolls back to the bottom and reads
 from the newest message backwards, stopping once two consecutive time-labelled
 messages are older than `TIME`. Only a message's own time label (the time text
 whose tooltip carries the date) decides this, so quoted or forwarded content
-with older dates does not end the range. Message times have minute precision, so `TIME` is compared at the start
+with older dates does not end the range. In `--since` results, each message's
+`date` and `time_raw` come from its own time label or, for bubbles without one,
+from the nearest newer label in the same range; messages that still resolve to
+before `TIME` are dropped. Message times have minute precision, so `TIME` is compared at the start
 of its minute. Combined with `--background-safe`, `--since` does not scroll and
 reads only the rows already loaded in the window.
 
