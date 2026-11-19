@@ -185,6 +185,9 @@ private final class KmsgSubprocessRunner {
 
 private final class KmsgMCPServer {
     private static let sinceLimitMax = 2_000
+    private static let chatsLimitDefault = 20
+    private static let chatsLimitMax = 200
+    private static let chatsTimeoutSec = 20.0
     private static let sinceTimeoutDefault = 180.0
     private static let sinceTimeoutMax = 600.0
 
@@ -361,6 +364,33 @@ private final class KmsgMCPServer {
                 ],
             ],
             [
+                "name": "kmsg_chats",
+                "description": "List KakaoTalk chats via kmsg with chat_id, last message preview, and unread badge count (unread_count, null when no badge). Read-only.",
+                "inputSchema": [
+                    "type": "object",
+                    "properties": [
+                        "limit": [
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": Self.chatsLimitMax,
+                            "default": Self.chatsLimitDefault,
+                            "description": "Maximum number of chats from the top of the chat list",
+                        ],
+                        "keep_window": [
+                            "type": "boolean",
+                            "default": false,
+                            "description": "Keep an auto-opened KakaoTalk chat list window",
+                        ],
+                        "trace_ax": [
+                            "type": "boolean",
+                            "default": traceDefault,
+                            "description": "Include AX tracing logs",
+                        ],
+                    ],
+                    "additionalProperties": false,
+                ],
+            ],
+            [
                 "name": "kmsg_send",
                 "description": "Send a KakaoTalk message via kmsg. Default sends immediately; confirm=true triggers confirmation-required response.",
                 "inputSchema": [
@@ -437,6 +467,8 @@ private final class KmsgMCPServer {
         switch name {
         case "kmsg_read":
             resultObject = callKmsgRead(arguments)
+        case "kmsg_chats":
+            resultObject = callKmsgChats(arguments)
         case "kmsg_send":
             resultObject = callKmsgSend(arguments)
         case "kmsg_send_image":
@@ -648,6 +680,92 @@ private final class KmsgMCPServer {
         if traceAX, !first.stderr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             var meta = response["meta"] as? JSONDict ?? [:]
             meta["stderr_trace"] = first.stderr
+            response["meta"] = meta
+        }
+        return response
+    }
+
+    private func callKmsgChats(_ arguments: JSONDict) -> JSONDict {
+        let rawLimit = arguments["limit"]
+        let limit: Int
+        if rawLimit == nil {
+            limit = Self.chatsLimitDefault
+        } else if let intValue = rawLimit as? Int {
+            limit = intValue
+        } else if let doubleValue = rawLimit as? Double {
+            limit = Int(doubleValue)
+        } else {
+            return errorPayload(
+                code: "INVALID_ARGUMENT",
+                message: "limit must be an integer",
+                hint: "Use integer range 1..\(Self.chatsLimitMax) for limit.",
+                rawStdout: "",
+                rawStderr: "",
+                latencyMs: 0
+            )
+        }
+        let boundedLimit = max(1, min(limit, Self.chatsLimitMax))
+        let keepWindow = boolValue(arguments["keep_window"], defaultValue: false)
+        let traceAX = boolValue(arguments["trace_ax"], defaultValue: traceDefault)
+
+        var command = ["chats", "--json", "--limit", String(boundedLimit)]
+        if keepWindow { command.append("--keep-window") }
+        if traceAX { command.append("--trace-ax") }
+
+        let run = runner.run(command, timeoutSec: Self.chatsTimeoutSec)
+        if run.timedOut {
+            return errorPayload(
+                code: "PROCESS_TIMEOUT",
+                message: "kmsg chats timed out",
+                hint: "Keep KakaoTalk open with the chat list visible, then retry.",
+                rawStdout: run.stdout,
+                rawStderr: run.stderr,
+                latencyMs: run.latencyMs
+            )
+        }
+        if run.returncode != 0 {
+            let code = extractErrorCode("\(run.stdout)\n\(run.stderr)")
+            return errorPayload(
+                code: code,
+                message: "kmsg chats failed",
+                hint: mapHint(code),
+                rawStdout: run.stdout,
+                rawStderr: run.stderr,
+                latencyMs: run.latencyMs
+            )
+        }
+        guard let payload = jsonObject(from: run.stdout) else {
+            return errorPayload(
+                code: "INVALID_JSON_OUTPUT",
+                message: "kmsg returned non-JSON output for chats --json",
+                hint: "Run kmsg chats --json manually and confirm JSON-only stdout.",
+                rawStdout: run.stdout,
+                rawStderr: run.stderr,
+                latencyMs: run.latencyMs
+            )
+        }
+
+        let rawChats = payload["chats"] as? [JSONDict] ?? []
+        let chats: [JSONDict] = rawChats.map { chat in
+            [
+                "title": chat["title"] ?? NSNull(),
+                "chat_id": chat["chat_id"] ?? NSNull(),
+                "last_message": chat["last_message"] ?? NSNull(),
+                "unread_count": chat["unread_count"] ?? NSNull(),
+                "unread_count_capped": chat["unread_count_capped"] ?? false,
+            ]
+        }
+        var response: JSONDict = [
+            "ok": true,
+            "count": payload["count"] ?? chats.count,
+            "chats": chats,
+            "meta": [
+                "latency_ms": run.latencyMs,
+            ],
+        ]
+        if traceAX, !run.stderr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            var meta = response["meta"] as? JSONDict ?? [:]
+            meta["stderr_trace"] = run.stderr
             response["meta"] = meta
         }
         return response

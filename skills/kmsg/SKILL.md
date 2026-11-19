@@ -59,7 +59,9 @@ kmsg chats --json
 
 Each entry carries `unread_count` (the chat list's unread badge, `null` when
 there is none; `unread_count_capped: true` for badges like `999+`). Use it to
-pick which chats need reading; it is read before any chat is opened.
+pick which chats need reading; it is read before any chat is opened. Through
+the MCP server (`kmsg mcp-server`), the read-only `kmsg_chats` tool returns the
+same entries.
 
 Match an exact chat title when possible. If there is one clear match, reuse its
 `chat_id` for reading and text sending. If multiple entries could match, show

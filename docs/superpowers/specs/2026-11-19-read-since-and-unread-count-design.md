@@ -55,7 +55,7 @@
 - `kmsg_read` 입력에 `since`(string)를 더한다. `since`가 있으면 `limit` 상한은 2000, 기본은 2000이다. 없으면 지금처럼 최대 100, 기본 20이다.
 - `since` 읽기의 자식 프로세스 제한 시간은 `timeout_sec` 입력(기본 180초, 최대 600초)으로 정한다. 쪽 수가 많으면 2분을 넘길 수 있다.
 - 결과 `meta`에 `since`, `oldest_reached`, `truncated`, `pages_loaded`를 싣는다.
-- `kmsg_chats` 결과는 `unread_count`를 그대로 전달한다.
+- `kmsg_chats` 결과는 `unread_count`를 그대로 전달한다. 설계 당시 MCP에는 `kmsg_chats` 도구가 없었으므로, 이 브랜치에서 읽기 전용 `kmsg_chats` 도구(`kmsg chats --json` 실행, 입력 `limit`·`keep_window`·`trace_ax`, 제한 시간 20초)를 새로 더했다.
 
 ### 4. 문서와 시험
 

@@ -66,7 +66,7 @@ https://github.com/user-attachments/assets/c620b2e3-7106-40fa-86d1-ed847e3b1a6f
 - 최근 메시지를 읽거나 새 메시지를 실시간으로 감시합니다.
 - 화면에 표시되는 KakaoTalk UI를 제어해 텍스트와 이미지를 전송합니다.
 - 구조화된 JSON을 `stdout`으로 출력하고 AX 추적 로그는 `stderr`로 분리합니다.
-- 읽기, 텍스트 전송, 이미지 전송 도구를 제공하는 native stdio MCP 서버를 실행합니다.
+- 채팅 목록(안 읽음 수 포함), 읽기, 텍스트 전송, 이미지 전송 도구를 제공하는 native stdio MCP 서버를 실행합니다.
 - background-safe 읽기, 창 레이아웃, 복구 모드, self-healing AX path cache를 지원합니다.
 
 ## 요구사항
@@ -177,7 +177,8 @@ Apple의 macOS 손쉬운 사용 API를 통해 화면에 표시되는 KakaoTalk
 ### MCP 서버가 포함되어 있나요?
 
 네. 네이티브 `kmsg mcp-server` 명령은 MCP 호환 클라이언트와 AI
-에이전트에 읽기, 텍스트 전송, 이미지 전송 도구를 stdio로 제공합니다.
+에이전트에 채팅 목록(`kmsg_chats`, 안 읽음 수 포함), 읽기, 텍스트 전송,
+이미지 전송 도구를 stdio로 제공합니다.
 
 ### kmsg는 어떻게 설치하나요?
 

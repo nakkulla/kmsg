@@ -39,7 +39,7 @@ https://github.com/user-attachments/assets/c620b2e3-7106-40fa-86d1-ed847e3b1a6f
 - Read recent messages or watch a chat for new messages.
 - Send text and images by controlling the visible KakaoTalk UI.
 - Produce structured JSON while keeping AX traces on `stderr`.
-- Run a native stdio MCP server with read, send, and image-send tools.
+- Run a native stdio MCP server with chat-list (with unread counts), read, send, and image-send tools.
 - Use background-safe reads, configurable window layouts, recovery modes, and
   a self-healing AX path cache.
 
@@ -150,8 +150,9 @@ Accessibility API. It does not implement KakaoTalk's private LOCO protocol.
 
 ### Does kmsg include an MCP server?
 
-Yes. The native `kmsg mcp-server` command exposes read, text-send, and
-image-send tools over stdio for MCP-compatible clients and AI agents.
+Yes. The native `kmsg mcp-server` command exposes chat-list (`kmsg_chats`, with
+unread counts), read, text-send, and image-send tools over stdio for
+MCP-compatible clients and AI agents.
 
 ### How do I install kmsg?
 

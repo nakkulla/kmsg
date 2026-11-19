@@ -387,6 +387,7 @@ The server exposes:
 
 | Tool | Purpose |
 |---|---|
+| `kmsg_chats` | List chats (read-only) with `title`, `chat_id`, `last_message`, `unread_count`, and `unread_count_capped`; optional `limit` (`1..200`, default `20`), `keep_window`, and `trace_ax`. |
 | `kmsg_read` | Read by `chat` or `chat_id`, with limit, `since`, `timeout_sec`, layout, recovery, background-safe, window, and trace controls. |
 | `kmsg_send` | Send a text message by chat name. |
 | `kmsg_send_image` | Send a local image by chat name. |
@@ -397,6 +398,11 @@ With `since`, `limit` is a safety cap clamped to `1..2000` (default `2000`), and
 `timeout_sec` (default `180`, range `10..600`) sets the process time limit. The
 result `meta` then also carries `since`, `oldest_reached`, `truncated`, and
 `pages_loaded`.
+
+`kmsg_chats` runs `kmsg chats --json` with a 20 second process time limit and
+returns `{ok, count, chats, meta: {latency_ms}}`. Each chat carries `title`,
+`chat_id`, `last_message`, `unread_count` (`null` when there is no badge), and
+`unread_count_capped`.
 
 For send tools, `confirm=false` or an omitted `confirm` sends immediately.
 `confirm=true` does not send; it returns `CONFIRMATION_REQUIRED` so a supervisor

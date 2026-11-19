@@ -152,6 +152,11 @@ class ReadSinceDocumentationTests(unittest.TestCase):
         self.assertIn("`pages_loaded`", usage)
         self.assertIn("`--max-pages N`", usage)
 
+    def test_docs_list_mcp_chats_tool(self) -> None:
+        for path in (README_KO, README_EN, USAGE, SKILL):
+            with self.subTest(path=path.name):
+                self.assertIn("kmsg_chats", path.read_text(encoding="utf-8"))
+
 
 if __name__ == "__main__":
     unittest.main()

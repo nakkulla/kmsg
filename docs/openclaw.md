@@ -11,6 +11,7 @@ There are two different interfaces:
 
 Today, MCP is still request/response only. It exposes:
 
+- `kmsg_chats`
 - `kmsg_read`
 - `kmsg_send`
 - `kmsg_send_image`
