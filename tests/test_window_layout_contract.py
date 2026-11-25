@@ -196,6 +196,23 @@ class SearchFieldCleanupContractTests(unittest.TestCase):
         self.assertIn('field.attributeOptional("AXCancelButton")', source)
         self.assertIn('subrole == "AXCancelButton"', source)
 
+    def test_search_results_left_behind_are_reset(self) -> None:
+        source = CHAT_WINDOW_RESOLVER.read_text(encoding="utf-8")
+        start = source.index("private func openChatViaSearch(")
+        end = source.index("private func openChatListRow(", start)
+        body = source[start:end]
+
+        # Exit: the list is checked after the field is restored.
+        restore = body.index("restoreSearchField(field, typedQuery: query, originalValue: originalSearchText)")
+        self.assertLess(restore, body.index("releaseSearchResultsLeftBehind(field: field, resultsList: resultsList, in: rootWindow)"))
+        # Entry: a list that ignores the query is reset before the row is opened.
+        reset = body.index("resetSearchList(in: rootWindow)")
+        self.assertLess(body.index("let listRebuilt = waitForSearchListRebuild("), reset)
+        self.assertLess(reset, body.index("let matchingCandidates = waitForMatchingSearchResults("))
+        self.assertIn("private func resetSearchList(in rootWindow: UIElement) -> Bool", source)
+        # The keyboard open still requires the selection to move.
+        self.assertIn("search: keyboard open stopped at step \\(step) (selection did not move)", source)
+
     def test_cache_warmup_restores_search_field(self) -> None:
         source = CACHE_COMMAND.read_text(encoding="utf-8")
 

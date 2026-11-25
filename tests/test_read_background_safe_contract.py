@@ -78,6 +78,15 @@ class ReadBackgroundSafeContractTests(unittest.TestCase):
         self.assertIn("likelyMessageImageFrames", source)
         self.assertIn("countURLTokens", source)
 
+    def test_image_count_ignores_scroll_position_and_bubble_backgrounds(self) -> None:
+        source = TRANSCRIPT_READER.read_text(encoding="utf-8")
+        start = source.index("private func isLikelyMessageImageFrame(")
+        end = source.index("private func isLikelySystemRow(", start)
+        body = source[start:end]
+
+        self.assertNotIn("transcriptFrame", body)
+        self.assertIn("textFrames.contains(where: { bubbleBounds.contains($0) })", body)
+
 
 if __name__ == "__main__":
     unittest.main()

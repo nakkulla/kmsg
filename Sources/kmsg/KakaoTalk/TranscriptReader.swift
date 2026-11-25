@@ -563,8 +563,8 @@ struct KakaoTalkTranscriptReader {
         let messageImageFrames = likelyMessageImageFrames(
             imageFrames,
             bodyFrame: bestBody?.frame,
-            rowFrame: cachedRowFrame,
-            transcriptRoot: transcriptRoot
+            textFrames: bodyCandidates.compactMap(\.frame),
+            rowFrame: cachedRowFrame
         )
         let imageCount = messageImageFrames.count
         let attachmentMetadataCount = uniqueMetadataTokens.filter(isLikelyAttachmentMetadataToken).count
@@ -799,24 +799,26 @@ struct KakaoTalkTranscriptReader {
     private func likelyMessageImageFrames(
         _ imageFrames: [CGRect],
         bodyFrame: CGRect?,
-        rowFrame: CGRect?,
-        transcriptRoot: UIElement
+        textFrames: [CGRect],
+        rowFrame: CGRect?
     ) -> [CGRect] {
         imageFrames.filter { frame in
             isLikelyMessageImageFrame(
                 frame,
                 bodyFrame: bodyFrame,
-                rowFrame: rowFrame,
-                transcriptFrame: transcriptRoot.frame
+                textFrames: textFrames,
+                rowFrame: rowFrame
             )
         }
     }
 
+    /// Judged from the row's own geometry only, so the answer does not depend on which
+    /// rows the transcript is scrolled to.
     private func isLikelyMessageImageFrame(
         _ frame: CGRect,
         bodyFrame: CGRect?,
-        rowFrame: CGRect?,
-        transcriptFrame: CGRect?
+        textFrames: [CGRect],
+        rowFrame: CGRect?
     ) -> Bool {
         guard frame.width >= 48, frame.height >= 48, frame.width * frame.height >= 2_304 else {
             return false
@@ -834,7 +836,9 @@ struct KakaoTalkTranscriptReader {
             return false
         }
 
-        if let transcriptFrame, !transcriptFrame.intersects(frame) {
+        // A text message's bubble background is an AXImage drawn around the message text.
+        let bubbleBounds = frame.insetBy(dx: -2, dy: -2)
+        if textFrames.contains(where: { bubbleBounds.contains($0) }) {
             return false
         }
 

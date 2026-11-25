@@ -432,10 +432,14 @@ struct ChatWindowResolver {
         // kmsg types the chat name into the main search field; put the field back on
         // every exit so the chat list is not left filtered (and later `chats` sees all rows).
         let originalSearchText = searchField.stringValue ?? ""
+        // Resetting a stale results list below closes the search, so the field is located again.
+        var queryField = searchField
         defer {
             // The field handle can go stale once the chat opens; re-locate it then.
-            let field = searchField.role != nil ? searchField : (locateSearchField(in: rootWindow) ?? searchField)
+            let field = queryField.role != nil ? queryField : (locateSearchField(in: rootWindow) ?? queryField)
+            let resultsList = searchListSnapshot(in: rootWindow)
             restoreSearchField(field, typedQuery: query, originalValue: originalSearchText)
+            releaseSearchResultsLeftBehind(field: field, resultsList: resultsList, in: rootWindow)
         }
 
         _ = runner.setTextWithVerification("", on: searchField, label: "search field clear", attempts: 1)
@@ -443,13 +447,14 @@ struct ChatWindowResolver {
             // Clearing a filtered list rebuilds it too; let that settle before the snapshot.
             Thread.sleep(forTimeInterval: 0.4)
         }
-        let listBeforeInput = searchListSnapshot(in: rootWindow)
+        var listBeforeInput = searchListSnapshot(in: rootWindow)
 
-        let searchInputReady =
-            runner.setTextWithVerification(query, on: searchField, label: "search field input", attempts: 1) ||
-            runner.typeTextWithVerification(query, on: searchField, label: "search field input", attempts: 2)
+        let enterQuery = { (field: UIElement) -> Bool in
+            self.runner.setTextWithVerification(query, on: field, label: "search field input", attempts: 1) ||
+                self.runner.typeTextWithVerification(query, on: field, label: "search field input", attempts: 2)
+        }
 
-        guard searchInputReady else {
+        guard enterQuery(searchField) else {
             dismissSearchAfterFailure()
             throw KakaoTalkError.actionFailed("[\(ChatWindowFailureCode.inputNotReflected.rawValue)] Search keyword was not entered")
         }
@@ -457,7 +462,32 @@ struct ChatWindowResolver {
         // The chat list keeps showing its unfiltered rows for a few hundred ms after the
         // query is typed. A row matched there is replaced by the search results, so wait
         // for the list to be rebuilt before scanning.
-        waitForSearchListRebuild(since: listBeforeInput, in: rootWindow)
+        let listRebuilt = waitForSearchListRebuild(since: listBeforeInput, in: rootWindow)
+
+        // An empty field over a list that does not react to the query is an earlier search's
+        // results left behind: its one row is already selected, so no arrow key can move the
+        // selection and the open below would refuse it. It never clears by itself.
+        if !listRebuilt,
+           listBeforeInput.firstRow != nil,
+           originalSearchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+           resetSearchList(in: rootWindow)
+        {
+            runner.log("search: list ignored the query; reset the results left by an earlier search")
+            guard let freshField = locateSearchField(in: rootWindow) else {
+                throw KakaoTalkError.elementNotFound("[\(ChatWindowFailureCode.searchMiss.rawValue)] Search field not found")
+            }
+            queryField = freshField
+            guard runner.focusWithVerification(queryField, label: "search field", attempts: 1) else {
+                throw KakaoTalkError.actionFailed("[\(ChatWindowFailureCode.focusFail.rawValue)] Could not focus search field")
+            }
+            _ = runner.setTextWithVerification("", on: queryField, label: "search field clear", attempts: 1)
+            listBeforeInput = searchListSnapshot(in: rootWindow)
+            guard enterQuery(queryField) else {
+                dismissSearchAfterFailure()
+                throw KakaoTalkError.actionFailed("[\(ChatWindowFailureCode.inputNotReflected.rawValue)] Search keyword was not entered")
+            }
+            waitForSearchListRebuild(since: listBeforeInput, in: rootWindow)
+        }
 
         let matchingCandidates = waitForMatchingSearchResults(query: query, rootWindow: rootWindow)
         guard let matchingResult = pickBestSearchResult(from: matchingCandidates) else {
@@ -470,7 +500,7 @@ struct ChatWindowResolver {
             matchingResult,
             query: query,
             rootWindow: rootWindow,
-            searchField: searchField
+            searchField: queryField
         ) {
             resolveOpenedChatWindowFast(query: query) != nil
         }
@@ -812,6 +842,58 @@ struct ChatWindowResolver {
         }
     }
 
+    /// Emptying the field does not always make KakaoTalk rebuild the list: the results of
+    /// kmsg's search can stay, under an empty field, until the search is closed.
+    private func releaseSearchResultsLeftBehind(field: UIElement, resultsList: SearchListSnapshot, in rootWindow: UIElement) {
+        guard resultsList.firstRow != nil,
+              (field.stringValue ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        else {
+            return
+        }
+        // Short on purpose: a list that is going to rebuild has done so by now, and reads run
+        // under a caller's time limit.
+        if waitForSearchListRebuild(since: resultsList, in: rootWindow, timeout: 0.15) {
+            return
+        }
+        if resetSearchList(in: rootWindow) {
+            runner.log("search: results stayed under the emptied field; reset the list")
+        }
+    }
+
+    /// The main window's search button closes the search and brings the full list back.
+    private func resetSearchList(in rootWindow: UIElement) -> Bool {
+        guard let button = searchToggleButtons(in: rootWindow).first else {
+            runner.log("search: no search button to reset the list with")
+            return false
+        }
+        do {
+            try button.press()
+        } catch {
+            runner.log("search: search button press failed (\(error))")
+            return false
+        }
+        Thread.sleep(forTimeInterval: 0.2)
+        return true
+    }
+
+    private func searchToggleButtons(in rootWindow: UIElement) -> [UIElement] {
+        rootWindow.findAll(role: kAXButtonRole, limit: 24, maxNodes: 220).filter { button in
+            let title = (button.title ?? "").lowercased()
+            let description = (button.axDescription ?? "").lowercased()
+            let identifier = (button.identifier ?? "").lowercased()
+
+            if identifier == "friends" || identifier == "chatrooms" || identifier == "more" {
+                return false
+            }
+
+            return title.contains("search")
+                || title.contains("검색")
+                || description.contains("search")
+                || description.contains("검색")
+                || identifier.contains("search")
+        }
+    }
+
     private func applyWindowFrame(_ frame: CGRect, to window: UIElement, label: String) {
         do {
             try window.setFrame(frame)
@@ -873,21 +955,7 @@ struct ChatWindowResolver {
             return field
         }
 
-        let searchButtons = rootWindow.findAll(role: kAXButtonRole, limit: 24, maxNodes: 220).filter { button in
-            let title = (button.title ?? "").lowercased()
-            let description = (button.axDescription ?? "").lowercased()
-            let identifier = (button.identifier ?? "").lowercased()
-
-            if identifier == "friends" || identifier == "chatrooms" || identifier == "more" {
-                return false
-            }
-
-            return title.contains("search")
-                || title.contains("검색")
-                || description.contains("search")
-                || description.contains("검색")
-                || identifier.contains("search")
-        }
+        let searchButtons = searchToggleButtons(in: rootWindow)
 
         for button in searchButtons.prefix(4) {
             do {
@@ -1345,12 +1413,12 @@ struct ChatWindowResolver {
     /// KakaoTalk replaces the list's rows when it switches to search results: the old
     /// row handles die and the table frame changes. Returns once either is observed.
     @discardableResult
-    private func waitForSearchListRebuild(since before: SearchListSnapshot, in rootWindow: UIElement) -> Bool {
+    private func waitForSearchListRebuild(since before: SearchListSnapshot, in rootWindow: UIElement, timeout: TimeInterval = 1.5) -> Bool {
         guard let oldFirstRow = before.firstRow else {
             runner.log("search: no list rows before input; skipping rebuild wait")
             return false
         }
-        let rebuilt = runner.waitUntil(label: "search list rebuild", timeout: 1.5, pollInterval: 0.04) {
+        let rebuilt = runner.waitUntil(label: "search list rebuild", timeout: timeout, pollInterval: 0.04) {
             if oldFirstRow.role == nil {
                 return true
             }

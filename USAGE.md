@@ -250,6 +250,12 @@ open a chat, it puts the field back afterwards (also on errors): it clears the
 name it typed, or restores the text that was there before. If the field holds
 some other text by then, kmsg leaves it alone.
 
+KakaoTalk can keep showing that search's results after the field is emptied,
+and a list left like that makes the next search for the same chat fail. kmsg
+checks the list after restoring the field, and again when a query it typed
+does not change the list, and closes the search with the main window's search
+button so the full chat list comes back.
+
 #### Reading since a time
 
 `--since` scrolls the chat transcript to the top repeatedly so KakaoTalk loads
@@ -508,6 +514,11 @@ kmsg read "홍길동" --limit 20 --json
 
 `date` and `time_raw` may be absent when KakaoTalk does not expose the
 corresponding metadata.
+
+`image_count` counts the images shown with a message's text. It is the same
+wherever the transcript is scrolled, and a text message's bubble background is
+not counted. A message with no text
+at all, such as a photo on its own, is not listed.
 
 With `--since`, the document adds four fields:
 
