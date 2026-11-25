@@ -87,31 +87,22 @@ private final class EarlyOffscreenMove {
     var origin: CGPoint?
 }
 
-/// Windows currently parked off the displays. A stop signal puts them back before the
-/// process exits: the MCP server terminates a call that runs over its time budget, and
-/// `defer` does not run then.
+/// Windows currently parked off the displays, and windows this call opened and owes a
+/// close. A stop signal puts the former back and closes the latter before the process
+/// exits: the MCP server terminates a call that runs over its time budget, and `defer`
+/// does not run then.
 private final class OffscreenParking: @unchecked Sendable {
     static let shared = OffscreenParking()
 
     private let lock = NSLock()
     private var parked: [(window: UIElement, origin: CGPoint)] = []
+    private var closeOnStop: [UIElement] = []
     private var signalSources: [DispatchSourceSignal] = []
 
     func park(_ window: UIElement, origin: CGPoint) {
         lock.lock()
         defer { lock.unlock() }
-        if signalSources.isEmpty {
-            for stopSignal in [SIGTERM, SIGINT] {
-                signal(stopSignal, SIG_IGN)
-                let source = DispatchSource.makeSignalSource(signal: stopSignal, queue: .global())
-                source.setEventHandler { [self] in
-                    restoreAll()
-                    exit(128 + stopSignal)
-                }
-                source.resume()
-                signalSources.append(source)
-            }
-        }
+        installSignalSources()
         parked.append((window, origin))
     }
 
@@ -121,11 +112,53 @@ private final class OffscreenParking: @unchecked Sendable {
         parked.removeAll { CFEqual($0.window.axElement, window.axElement) }
     }
 
+    func closeOnStop(_ window: UIElement) {
+        lock.lock()
+        defer { lock.unlock() }
+        installSignalSources()
+        closeOnStop.append(window)
+    }
+
+    func cancelCloseOnStop(_ window: UIElement) {
+        lock.lock()
+        defer { lock.unlock() }
+        closeOnStop.removeAll { CFEqual($0.axElement, window.axElement) }
+    }
+
+    /// Caller holds `lock`.
+    private func installSignalSources() {
+        guard signalSources.isEmpty else { return }
+        for stopSignal in [SIGTERM, SIGINT] {
+            signal(stopSignal, SIG_IGN)
+            let source = DispatchSource.makeSignalSource(signal: stopSignal, queue: .global())
+            source.setEventHandler { [self] in
+                restoreAll()
+                closeAll()
+                exit(128 + stopSignal)
+            }
+            source.resume()
+            signalSources.append(source)
+        }
+    }
+
     private func restoreAll() {
         lock.lock()
         defer { lock.unlock() }
         for entry in parked {
             try? entry.window.setPosition(entry.origin)
+        }
+    }
+
+    /// Presses each owed window's own close button, which works without KakaoTalk in front.
+    /// Nothing waits for the window to go: the caller that sent the signal waits only briefly.
+    private func closeAll() {
+        lock.lock()
+        defer { lock.unlock() }
+        for window in closeOnStop {
+            guard let closeButton: AXUIElement = window.attributeOptional(kAXCloseButtonAttribute) else {
+                continue
+            }
+            try? UIElement(closeButton).press()
         }
     }
 }
@@ -784,6 +817,15 @@ struct ChatWindowResolver {
         let landed = window.position.map { "\(Int($0.x)),\(Int($0.y))" } ?? "unknown"
         runner.log("offscreen: moved from \(Int(frame.minX)),\(Int(frame.minY)) toward \(Int(target.x)),\(Int(target.y)); now \(landed)")
         return origin
+    }
+
+    /// Marks a window this call opened so that a stop signal closes it; `defer` does not run then.
+    func closeWindowOnStopSignal(_ window: UIElement) {
+        OffscreenParking.shared.closeOnStop(window)
+    }
+
+    func cancelCloseOnStopSignal(_ window: UIElement) {
+        OffscreenParking.shared.cancelCloseOnStop(window)
     }
 
     func restoreWindowPosition(_ window: UIElement, to origin: CGPoint) {

@@ -272,6 +272,16 @@ before `TIME` are dropped. Message times have minute precision, so `TIME` is com
 of its minute. Combined with `--background-safe`, `--since` does not scroll and
 reads only the rows already loaded in the window.
 
+#### Reading the latest messages
+
+Without `--since`, `kmsg read` takes the rows straight from the chat's transcript
+table, newest first, and stops once `--limit` messages and the author of the oldest
+one are in hand. `date` and `time_raw` follow the `--since` rule above: a message's
+own time label, or the nearest newer label for a bubble without one. A message
+therefore carries the same time in both reads. A window without a transcript table,
+or one that yields too few messages this way, is read by searching for its rows as
+before.
+
 #### If `--background-safe` is missing
 
 The CLI flag is available in kmsg `v1.260618.0` and later, and belongs only to
@@ -425,6 +435,8 @@ The server exposes:
 
 `kmsg_read` limits: without `since`, `limit` is clamped to `1..100` (default
 `20`) and the read process times out after 8 seconds (15 with deep recovery).
+A process that runs over its time limit gets a stop signal and up to 2 seconds to
+put a moved window back and close the chat window it opened, before it is killed.
 With `since`, `limit` is a safety cap clamped to `1..2000` (default `2000`), and
 `timeout_sec` (default `180`, range `10..600`) sets the process time limit. The
 result `meta` then also carries `since`, `oldest_reached`, `truncated`,

@@ -215,8 +215,18 @@ struct ReadCommand: ParsableCommand {
             }
         }
 
+        // A window this read opened is closed on a stop signal too, under the same title check
+        // as the close below.
+        let resolvedTitleAtOpen = window.title ?? ""
+        let titleMatchesQuery = chatID != nil || resolvedTitleAtOpen.isEmpty
+            || resolvedTitleAtOpen.localizedCaseInsensitiveContains(requestedChat)
+        if resolution.openedTransiently && !keepWindow && titleMatchesQuery {
+            chatWindowResolver.closeWindowOnStopSignal(window)
+        }
+
         defer {
             restoreOffscreenWindow()
+            chatWindowResolver.cancelCloseOnStopSignal(window)
             if resolution.openedTransiently && !keepWindow {
                 let resolvedTitle = window.title ?? ""
                 if chatID == nil && !resolvedTitle.isEmpty && !resolvedTitle.localizedCaseInsensitiveContains(requestedChat) {

@@ -164,6 +164,26 @@ struct KakaoTalkTranscriptReader {
         referenceDate: Date = Date()
     ) throws -> TranscriptSnapshot {
 
+        // The transcript table gives the rows directly; collecting them by search and
+        // analyzing every one of them is the slow path kept for a window without a table.
+        if let table = transcriptTable(in: context.transcriptRoot) {
+            let tableMessages = readRecentFromTable(
+                table,
+                context: context,
+                limit: limit,
+                includeSystemMessages: includeSystemMessages,
+                referenceDate: referenceDate
+            )
+            if tableMessages.count >= min(limit, Self.minimumTableMessages(limit: limit)) {
+                return TranscriptSnapshot(
+                    chat: chatWindow.title ?? fallbackChatTitle,
+                    fetchedAt: referenceDate,
+                    messages: tableMessages
+                )
+            }
+            runner.log("read: table path gave \(tableMessages.count) message(s); falling back to row search")
+        }
+
         let frameCache = FrameCache()
         let messageRows = collectTranscriptRows(
             from: context.transcriptRoot,
@@ -1685,6 +1705,67 @@ extension KakaoTalkTranscriptReader {
     }
 
     // MARK: Table access
+
+    /// Below this many messages the table path is taken as failed, as the row search
+    /// path judges its own result.
+    fileprivate static func minimumTableMessages(limit: Int) -> Int {
+        max(3, min(limit / 2, 8))
+    }
+
+    /// The latest `limit` messages read the way `readSince` reads them: rows straight from
+    /// the transcript table, newest first, analyzed only until `limit` messages and an
+    /// author anchor are in hand, with time and date from each row's own label. Both reads
+    /// then give the same message the same time.
+    fileprivate func readRecentFromTable(
+        _ table: UIElement,
+        context: MessageTranscriptContext,
+        limit: Int,
+        includeSystemMessages: Bool,
+        referenceDate: Date
+    ) -> [TranscriptMessage] {
+        let frameCache = FrameCache()
+        let rows = orderedRows(of: table, frameCache: frameCache)
+        guard !rows.isEmpty else { return [] }
+
+        let inputMinY = context.inputElement.frame?.minY
+        var reversedAnalyses: [RowAnalysis] = []
+        var collected = 0
+        var contextRows = 0
+        for row in rows.reversed() {
+            if collected >= limit, contextRows >= Self.anchorContextRows {
+                break
+            }
+            if let inputMinY, let rowFrame = frameCache.frame(of: row), rowFrame.maxY > inputMinY + 20 {
+                continue
+            }
+            let analysis = analyzeRow(row, transcriptRoot: context.transcriptRoot, referenceDate: referenceDate, frameCache: frameCache)
+            reversedAnalyses.append(analysis)
+            if collected >= limit {
+                // Past the limit a row only serves as the author anchor of the oldest kept message.
+                contextRows += 1
+                if analysis.explicitAuthor != nil {
+                    break
+                }
+            } else if analysis.bodyCandidate != nil, includeSystemMessages || !analysis.isSystemLikeRow {
+                collected += 1
+            }
+        }
+
+        let analyses = Array(reversedAnalyses.reversed())
+        let indexed = buildMessages(
+            from: analyses,
+            limit: limit,
+            includeSystemMessages: includeSystemMessages,
+            referenceDate: referenceDate
+        )
+        let ownLabels = resolveOwnLabels(analyses, from: 0)
+        let messages = indexed.map { entry -> TranscriptMessage in
+            let label = ownLabels[entry.analysisIndex]
+            return entry.message.withDateTime(date: label?.date, timeRaw: label?.time)
+        }
+        runner.log("read: table rows=\(rows.count) analyzed=\(analyses.count) messages=\(messages.count)")
+        return Array(messages.suffix(limit))
+    }
 
     private func transcriptTable(in transcriptRoot: UIElement) -> UIElement? {
         if transcriptRoot.role == kAXTableRole {

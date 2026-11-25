@@ -47,6 +47,9 @@ private final class MCPDataBuffer: @unchecked Sendable {
 }
 
 private final class KmsgSubprocessRunner {
+    /// How long a timed-out child gets after the stop signal before it is killed.
+    private static let terminateGraceSec: TimeInterval = 2.0
+
     let executablePath: String
 
     init() {
@@ -110,7 +113,8 @@ private final class KmsgSubprocessRunner {
                 terminateSemaphore.signal()
             }
 
-            if terminateSemaphore.wait(timeout: .now() + 0.5) == .timedOut {
+            // The child closes the chat window it opened before it exits on the stop signal.
+            if terminateSemaphore.wait(timeout: .now() + Self.terminateGraceSec) == .timedOut {
                 kill(process.processIdentifier, SIGKILL)
                 process.waitUntilExit()
             }
