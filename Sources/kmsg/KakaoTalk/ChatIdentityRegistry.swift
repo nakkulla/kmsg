@@ -115,6 +115,10 @@ final class ChatIdentityRegistryStore: @unchecked Sendable {
         return assignedIDs
     }
 
+    func recordCount(normalizedName: String) -> Int {
+        loadDocument().records.filter { $0.normalizedName == normalizedName }.count
+    }
+
     func record(for chatID: String) -> ChatIdentityRecord? {
         let document = loadDocument()
         return document.records.first(where: { $0.chatID == chatID })

@@ -90,7 +90,15 @@ struct ChatListSnapshotItem {
 }
 
 struct ChatListScanner {
-    func scan(in window: UIElement, limit: Int, trace: ((String) -> Void)? = nil) -> [ChatListSnapshotItem] {
+    /// With `onlyNormalizedTitle`, rows with another title are skipped right after their
+    /// title is read (no preview or badge lookup), and the scan ends after `stopAfter` matches.
+    func scan(
+        in window: UIElement,
+        limit: Int,
+        onlyNormalizedTitle: String? = nil,
+        stopAfter: Int? = nil,
+        trace: ((String) -> Void)? = nil
+    ) -> [ChatListSnapshotItem] {
         guard let container = resolveChatListContainer(in: window, trace: trace) else {
             trace?("chats: chat list container unavailable")
             return []
@@ -107,6 +115,9 @@ struct ChatListScanner {
 
         for (index, row) in rows.enumerated() {
             let title = extractTitle(from: row, trace: trace)
+            if let onlyNormalizedTitle, ChatTextNormalizer.normalize(title) != onlyNormalizedTitle {
+                continue
+            }
             let preview = extractPreview(from: row, title: title, trace: trace)
             let badge = extractUnreadBadge(from: row)
             let discovery = ChatListDiscovery(
@@ -117,6 +128,9 @@ struct ChatListScanner {
                 unreadCountCapped: badge?.capped ?? false
             )
             snapshots.append(ChatListSnapshotItem(element: row, discovery: discovery))
+            if let stopAfter, snapshots.count >= stopAfter {
+                break
+            }
         }
 
         trace?("chats: resolved rows=\(snapshots.count)")

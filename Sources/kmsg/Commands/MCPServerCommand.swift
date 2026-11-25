@@ -316,7 +316,7 @@ private final class KmsgMCPServer {
         [
             [
                 "name": "kmsg_read",
-                "description": "Read recent KakaoTalk messages from a chat via kmsg, or every message since a time with since.",
+                "description": "Read recent KakaoTalk messages from a chat via kmsg, or every message since a time with since. With since, meta.truncated tells whether the range is incomplete and meta.stop_reason why (complete, page_cap, deadline, limit, scroll_failed, rows_unreadable, paging_unavailable).",
                 "inputSchema": [
                     "type": "object",
                     "properties": [
@@ -681,6 +681,7 @@ private final class KmsgMCPServer {
             meta["oldest_reached"] = payload["oldest_reached"] ?? false
             meta["truncated"] = payload["truncated"] ?? false
             meta["pages_loaded"] = payload["pages_loaded"] ?? 0
+            meta["stop_reason"] = payload["stop_reason"] ?? NSNull()
             response["meta"] = meta
         }
         if traceAX, !first.stderr.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {

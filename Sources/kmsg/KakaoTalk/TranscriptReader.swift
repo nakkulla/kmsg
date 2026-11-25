@@ -436,6 +436,7 @@ struct KakaoTalkTranscriptReader {
         var labelTime: String?
         var linkElementCount = 0
         var urlTokenCount = 0
+        var hasContent = false
 
         for container in containers {
             var textAreas: [UIElement] = []
@@ -486,6 +487,10 @@ struct KakaoTalkTranscriptReader {
                 if images.isEmpty { images = found[kAXImageRole] ?? [] }
                 if buttons.isEmpty { buttons = found[kAXButtonRole] ?? [] }
                 if links.isEmpty { links = found[kAXLinkRole] ?? [] }
+            }
+
+            if !(textAreas.isEmpty && staticTexts.isEmpty && images.isEmpty && buttons.isEmpty && links.isEmpty) {
+                hasContent = true
             }
 
             for staticText in staticTexts {
@@ -590,7 +595,8 @@ struct KakaoTalkTranscriptReader {
             isSystemLikeRow: systemLikeRow,
             axHelpDate: rowHelpDate,
             labelDate: labelDate,
-            labelTime: labelTime
+            labelTime: labelTime,
+            hasContent: hasContent
         )
     }
 
@@ -1203,6 +1209,20 @@ struct TranscriptHistoryInfo: Sendable {
     /// The range back to `since` was not fully covered (page cap, time budget,
     /// disallowed page-up), or `limit` dropped older messages.
     let truncated: Bool
+    /// Why the read ended; `.complete` exactly when `truncated` is false.
+    let stopReason: TranscriptStopReason
+}
+
+enum TranscriptStopReason: String, Sendable, Encodable {
+    case complete
+    case pageCap = "page_cap"
+    case deadline
+    case limit
+    case scrollFailed = "scroll_failed"
+    /// Rows back to `since` were loaded but came back without content or time labels.
+    case rowsUnreadable = "rows_unreadable"
+    /// Older history could not be paged in (background-safe mode, no scrollable table).
+    case pagingUnavailable = "paging_unavailable"
 }
 
 struct TranscriptSinceSnapshot: Sendable {
@@ -1215,10 +1235,23 @@ private enum LoadedEdgeTime {
     case day(Date)
 }
 
+private enum PagingStop {
+    case edgeOlder
+    case conversationStart
+    case pageCap
+    case deadline
+    case scrollFailed
+    case rowCountUnreadable
+    case unavailable
+}
+
 private struct HistoryLoadOutcome {
     var pagesLoaded = 0
     var oldestReached = false
     var capped = false
+    var stop: PagingStop = .unavailable
+    /// Set once the transcript was scrolled up; the caller restores it after reading rows.
+    var scrolledBar: UIElement?
 }
 
 extension KakaoTalkTranscriptReader {
@@ -1226,6 +1259,8 @@ extension KakaoTalkTranscriptReader {
     private static let pagePollInterval: TimeInterval = 0.15
     private static let peekRowCount = 12
     private static let anchorContextRows = 8
+    /// A lone empty row is KakaoTalk's spacer at either end; a longer stretch is unread content.
+    private static let emptyStretchMinRows = 2
 
     /// Reads every message at or after `since`, paging older history into the
     /// transcript table first. Messages are returned oldest first; at most `limit`
@@ -1265,23 +1300,14 @@ extension KakaoTalkTranscriptReader {
         } else if allowPaging {
             runner.log("read-since: transcript table unavailable; reading loaded rows only")
         }
-
-        let frameCache = FrameCache()
-        let rows: [UIElement]
-        if let table {
-            rows = orderedRows(of: table, frameCache: frameCache)
-        } else {
-            rows = collectTranscriptRows(
-                from: context.transcriptRoot,
-                inputElement: context.inputElement,
-                messageLimit: 20,
-                frameCache: frameCache
-            )
+        // Rows are read before the scroll position is restored: back at the bottom,
+        // KakaoTalk at times hands out the oldest loaded rows without any content.
+        let scrolledBar = outcome.scrolledBar
+        defer {
+            if let scrolledBar {
+                scrollToBottom(scrolledBar)
+            }
         }
-        guard !rows.isEmpty else {
-            throw TranscriptReadError.noMessageRows
-        }
-        runner.log("read-since: rows=\(rows.count) pages=\(outcome.pagesLoaded) oldestReached=\(outcome.oldestReached)")
 
         // Analyze newest first and stop once a row is provably older than `since`,
         // then a few more rows so the forward pass has an author anchor.
@@ -1291,53 +1317,99 @@ extension KakaoTalkTranscriptReader {
         let inputMinY = context.inputElement.frame?.minY
         var reversedAnalyses: [RowAnalysis] = []
         var crossedSince = false
-        var pendingCross: Int?
         var crossReversedIndex: Int?
-        var contextRows = 0
         var deadlineHit = false
-        var rowsExhausted = true
-        for row in rows.reversed() {
-            if crossedSince, contextRows >= Self.anchorContextRows {
-                rowsExhausted = false
-                break
+        // Rows without any accessibility content, before `since` is crossed; the run is the
+        // stretch of them at the oldest end.
+        var emptyRows = 0
+        var emptyRowRun = 0
+        var rereadDone = false
+        while true {
+            let frameCache = FrameCache()
+            let rows: [UIElement]
+            if let table {
+                rows = orderedRows(of: table, frameCache: frameCache)
+            } else {
+                rows = collectTranscriptRows(
+                    from: context.transcriptRoot,
+                    inputElement: context.inputElement,
+                    messageLimit: 20,
+                    frameCache: frameCache
+                )
             }
-            if Date() >= deadline {
-                deadlineHit = true
-                rowsExhausted = false
-                break
+            guard !rows.isEmpty else {
+                throw TranscriptReadError.noMessageRows
             }
-            if let inputMinY, let rowFrame = frameCache.frame(of: row), rowFrame.maxY > inputMinY + 20 {
-                continue
-            }
-            let analysis = analyzeRow(row, transcriptRoot: context.transcriptRoot, referenceDate: referenceDate, frameCache: frameCache)
-            let reversedIndex = reversedAnalyses.count
-            reversedAnalyses.append(analysis)
-            let older = analysis.labelTimestamp.map { $0 < sinceMinute }
+            runner.log("read-since: rows=\(rows.count) pages=\(outcome.pagesLoaded) oldestReached=\(outcome.oldestReached)")
 
-            if crossedSince {
-                contextRows += 1
-            } else if let older {
-                if !older {
-                    pendingCross = nil
-                } else if let pending = pendingCross {
-                    crossedSince = true
-                    crossReversedIndex = pending
-                } else {
-                    pendingCross = reversedIndex
+            reversedAnalyses = []
+            crossedSince = false
+            crossReversedIndex = nil
+            deadlineHit = false
+            emptyRows = 0
+            emptyRowRun = 0
+            var pendingCross: Int?
+            var contextRows = 0
+            var rowsExhausted = true
+            for row in rows.reversed() {
+                if crossedSince, contextRows >= Self.anchorContextRows {
+                    rowsExhausted = false
+                    break
+                }
+                if Date() >= deadline {
+                    deadlineHit = true
+                    rowsExhausted = false
+                    break
+                }
+                // Frames only place rows against the input field while the transcript sits at the bottom.
+                if scrolledBar == nil, let inputMinY, let rowFrame = frameCache.frame(of: row), rowFrame.maxY > inputMinY + 20 {
+                    continue
+                }
+                let analysis = analyzeRow(row, transcriptRoot: context.transcriptRoot, referenceDate: referenceDate, frameCache: frameCache)
+                let reversedIndex = reversedAnalyses.count
+                reversedAnalyses.append(analysis)
+                let older = analysis.labelTimestamp.map { $0 < sinceMinute }
+                if !crossedSince {
+                    emptyRowRun = analysis.hasContent ? 0 : emptyRowRun + 1
+                    emptyRows += analysis.hasContent ? 0 : 1
+                }
+
+                if crossedSince {
+                    contextRows += 1
+                } else if let older {
+                    if !older {
+                        pendingCross = nil
+                    } else if let pending = pendingCross {
+                        crossedSince = true
+                        crossReversedIndex = pending
+                    } else {
+                        pendingCross = reversedIndex
+                    }
+                }
+                runner.log(
+                    "read-since: row[-\(reversedIndex + 1)] date=\(analysis.labelDate ?? analysis.axHelpDate ?? "-") time=\(analysis.labelTime ?? analysis.timeRaw ?? "-") ownLabel=\(analysis.labelTime != nil ? "yes" : "no") author=\(analysis.explicitAuthor != nil ? "yes" : "no") older=\(older.map { $0 ? "yes" : "no" } ?? "-") crossed=\(crossedSince ? "yes" : "no")"
+                )
+                if crossedSince, contextRows > 0, analysis.explicitAuthor != nil {
+                    rowsExhausted = false
+                    break
                 }
             }
-            runner.log(
-                "read-since: row[-\(reversedIndex + 1)] date=\(analysis.labelDate ?? analysis.axHelpDate ?? "-") time=\(analysis.labelTime ?? analysis.timeRaw ?? "-") ownLabel=\(analysis.labelTime != nil ? "yes" : "no") author=\(analysis.explicitAuthor != nil ? "yes" : "no") older=\(older.map { $0 ? "yes" : "no" } ?? "-") crossed=\(crossedSince ? "yes" : "no")"
-            )
-            if crossedSince, contextRows > 0, analysis.explicitAuthor != nil {
-                rowsExhausted = false
+            // The oldest loaded time label is older than `since` with nothing older to confirm it.
+            // Empty rows beyond it confirm nothing either way.
+            if !crossedSince, rowsExhausted, emptyRowRun < Self.emptyStretchMinRows, let pending = pendingCross {
+                crossedSince = true
+                crossReversedIndex = pending
+            }
+
+            // Empty rows at the oldest end hide the stretch that should cross `since`:
+            // scroll back up and read the rows once more before settling for a partial result.
+            guard !crossedSince, !deadlineHit, emptyRowRun >= Self.emptyStretchMinRows, !rereadDone, let scrolledBar, Date() < deadline else {
                 break
             }
-        }
-        // The oldest loaded time label is older than `since` with nothing older to confirm it.
-        if !crossedSince, rowsExhausted, let pending = pendingCross {
-            crossedSince = true
-            crossReversedIndex = pending
+            rereadDone = true
+            runner.log("read-since: \(emptyRowRun) oldest row(s) came back empty; scrolling up and reading again")
+            try? scrolledBar.setAttribute(kAXValueAttribute, value: NSNumber(value: 0.0))
+            Thread.sleep(forTimeInterval: 1.0)
         }
 
         let analyses = Array(reversedAnalyses.reversed())
@@ -1376,10 +1448,25 @@ extension KakaoTalkTranscriptReader {
 
         // Covered when a row older than `since` was seen, or every loaded row was
         // analyzed and the loaded rows reach back to the conversation start.
-        let covered = crossedSince || (outcome.oldestReached && !deadlineHit)
+        // Empty rows at the oldest end hide whatever sits there, the conversation start included.
+        let covered = crossedSince || (outcome.oldestReached && !deadlineHit && emptyRowRun < Self.emptyStretchMinRows)
         let truncated = limitHit || !covered
+        let stopReason: TranscriptStopReason
+        if covered {
+            stopReason = limitHit ? .limit : .complete
+        } else if deadlineHit {
+            stopReason = .deadline
+        } else {
+            switch outcome.stop {
+            case .pageCap: stopReason = .pageCap
+            case .deadline: stopReason = .deadline
+            case .scrollFailed: stopReason = .scrollFailed
+            case .unavailable: stopReason = .pagingUnavailable
+            case .edgeOlder, .conversationStart, .rowCountUnreadable: stopReason = .rowsUnreadable
+            }
+        }
         runner.log(
-            "read-since: analyzed=\(analyses.count) messages=\(messages.count) crossed=\(crossedSince) deadlineHit=\(deadlineHit) limitHit=\(limitHit) pageCapped=\(outcome.capped)"
+            "read-since: analyzed=\(analyses.count) messages=\(messages.count) crossed=\(crossedSince) deadlineHit=\(deadlineHit) limitHit=\(limitHit) pageCapped=\(outcome.capped) emptyRows=\(emptyRows) emptyOldestRun=\(emptyRowRun) stop=\(stopReason.rawValue)"
         )
 
         return TranscriptSinceSnapshot(
@@ -1392,7 +1479,8 @@ extension KakaoTalkTranscriptReader {
                 since: since,
                 pagesLoaded: outcome.pagesLoaded,
                 oldestReached: outcome.oldestReached,
-                truncated: truncated
+                truncated: truncated,
+                stopReason: stopReason
             )
         )
     }
@@ -1451,39 +1539,43 @@ extension KakaoTalkTranscriptReader {
             // Nothing to scroll: the whole conversation fits in the loaded rows.
             runner.log("read-since: no vertical scroll bar; treating loaded rows as complete")
             outcome.oldestReached = true
+            outcome.stop = .conversationStart
             return outcome
         }
         let scrollBar = UIElement(scrollBarElement)
         guard var rowCount = rowCount(of: table), rowCount > 0 else {
             runner.log("read-since: row count unavailable; skipping page-up")
             outcome.capped = true
+            outcome.stop = .rowCountUnreadable
             return outcome
-        }
-
-        var scrolled = false
-        defer {
-            if scrolled {
-                scrollToBottom(scrollBar)
-            }
         }
 
         while true {
             if let edge = peekOldestLoadedTime(in: table), isEdgeOlder(edge, sinceMinute: sinceMinute) {
                 runner.log("read-since: oldest loaded row is older than since after \(outcome.pagesLoaded) page(s)")
+                outcome.stop = .edgeOlder
                 break
             }
-            if outcome.pagesLoaded >= maxPages || Date() >= deadline {
+            if outcome.pagesLoaded >= maxPages {
                 runner.log("read-since: page cap reached pages=\(outcome.pagesLoaded)")
                 outcome.capped = true
+                outcome.stop = .pageCap
+                break
+            }
+            if Date() >= deadline {
+                runner.log("read-since: paging time budget used up pages=\(outcome.pagesLoaded)")
+                outcome.capped = true
+                outcome.stop = .deadline
                 break
             }
 
             do {
                 try scrollBar.setAttribute(kAXValueAttribute, value: NSNumber(value: 0.0))
-                scrolled = true
+                outcome.scrolledBar = scrollBar
             } catch {
                 runner.log("read-since: failed to scroll transcript up: \(error)")
                 outcome.capped = true
+                outcome.stop = .scrollFailed
                 break
             }
 
@@ -1500,12 +1592,19 @@ extension KakaoTalkTranscriptReader {
             }
 
             guard let grownCount else {
-                if let lastObserved, lastObserved > 0 {
+                if Date() >= deadline {
+                    // The wait was cut short, so an unchanged count says nothing about the start.
+                    runner.log("read-since: paging time budget used up while waiting for page \(outcome.pagesLoaded + 1)")
+                    outcome.capped = true
+                    outcome.stop = .deadline
+                } else if let lastObserved, lastObserved > 0 {
                     runner.log("read-since: row count stayed at \(lastObserved); conversation start reached")
                     outcome.oldestReached = true
+                    outcome.stop = .conversationStart
                 } else {
                     runner.log("read-since: row count unreadable while paging; stopping")
                     outcome.capped = true
+                    outcome.stop = .rowCountUnreadable
                 }
                 break
             }
@@ -1672,6 +1771,8 @@ private struct RowAnalysis {
     /// Date and time from the row's own time label only (see `TranscriptTime.timeLabel`).
     let labelDate: String?
     let labelTime: String?
+    /// False when the row exposed no text, image, button, or link element at all.
+    let hasContent: Bool
 
     var labelTimestamp: Date? {
         TranscriptTime.localDate(date: labelDate, timeRaw: labelTime)

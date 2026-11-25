@@ -14,6 +14,7 @@ struct ReadCommand: ParsableCommand {
         let oldestReached: Bool?
         let truncated: Bool?
         let pagesLoaded: Int?
+        let stopReason: TranscriptStopReason?
 
         enum CodingKeys: String, CodingKey {
             case chat
@@ -24,6 +25,7 @@ struct ReadCommand: ParsableCommand {
             case oldestReached = "oldest_reached"
             case truncated
             case pagesLoaded = "pages_loaded"
+            case stopReason = "stop_reason"
         }
     }
 
@@ -279,7 +281,7 @@ struct ReadCommand: ParsableCommand {
         print("Reading messages from: \(snapshot.chat)\n")
         if let history {
             print("Messages since \(SinceParser.format(history.since)) (\(snapshot.count)):")
-            print("pages_loaded: \(history.pagesLoaded), oldest_reached: \(history.oldestReached), truncated: \(history.truncated)\n")
+            print("pages_loaded: \(history.pagesLoaded), oldest_reached: \(history.oldestReached), truncated: \(history.truncated), stop_reason: \(history.stopReason.rawValue)\n")
         } else {
             print("Recent messages (\(snapshot.count)):\n")
         }
@@ -308,7 +310,8 @@ struct ReadCommand: ParsableCommand {
             since: history.map { SinceParser.format($0.since) },
             oldestReached: history?.oldestReached,
             truncated: history?.truncated,
-            pagesLoaded: history?.pagesLoaded
+            pagesLoaded: history?.pagesLoaded,
+            stopReason: history?.stopReason
         )
 
         let encoder = JSONEncoder()

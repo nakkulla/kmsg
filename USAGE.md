@@ -421,8 +421,8 @@ The server exposes:
 `20`) and the read process times out after 8 seconds (15 with deep recovery).
 With `since`, `limit` is a safety cap clamped to `1..2000` (default `2000`), and
 `timeout_sec` (default `180`, range `10..600`) sets the process time limit. The
-result `meta` then also carries `since`, `oldest_reached`, `truncated`, and
-`pages_loaded`.
+result `meta` then also carries `since`, `oldest_reached`, `truncated`,
+`pages_loaded`, and `stop_reason`.
 
 `kmsg_chats` runs `kmsg chats --json` with a 20 second process time limit and
 returns `{ok, count, chats, meta: {latency_ms}}`. Each chat carries `title`,
@@ -524,7 +524,8 @@ kmsg read --chat-id "chat_7f42c5e1d9ab" --since 2026-11-18T07:00:00+09:00 --json
   "since": "2026-11-18T07:00:00+09:00",
   "oldest_reached": false,
   "truncated": false,
-  "pages_loaded": 1
+  "pages_loaded": 1,
+  "stop_reason": "complete"
 }
 ```
 
@@ -533,6 +534,14 @@ kmsg read --chat-id "chat_7f42c5e1d9ab" --since 2026-11-18T07:00:00+09:00 --json
 or `--limit` before covering `since`, or when `--background-safe` prevented
 loading older history; the returned messages are then the newest part of the
 range. An empty range returns `count: 0`.
+
+`stop_reason` says why the read ended: `complete` (the range back to `since` is
+covered), `page_cap` (`--max-pages`), `deadline` (`--timeout-sec`), `limit`
+(`--limit` dropped older messages), `scroll_failed` (the transcript could not be
+scrolled up), `rows_unreadable` (rows reaching back to `since` were loaded but
+KakaoTalk exposed no content for them, even after one re-read; retrying usually
+helps), or `paging_unavailable` (`--background-safe`, or no scrollable
+transcript). It is `complete` exactly when `truncated` is `false`.
 
 ### Watch
 

@@ -231,7 +231,13 @@ struct ChatWindowResolver {
         }
 
         if let chatListWindow = kakao.chatListWindow,
-           let chatWindow = openChatListRow(chatID: chatID, query: query, in: chatListWindow, fallbackWindow: usableWindow)
+           let chatWindow = openChatListRow(
+               chatID: chatID,
+               normalizedName: record.normalizedName,
+               query: query,
+               in: chatListWindow,
+               fallbackWindow: usableWindow
+           )
         {
             standardizeReadableWindow(chatWindow, label: "opened chat window")
             return ChatWindowResolution(window: chatWindow, method: .openedViaChatList)
@@ -494,19 +500,35 @@ struct ChatWindowResolver {
         runner.pressEscape()
     }
 
-    private func openChatListRow(chatID: String, query: String, in chatListWindow: UIElement, fallbackWindow: UIElement) -> UIElement? {
+    private func openChatListRow(
+        chatID: String,
+        normalizedName: String,
+        query: String,
+        in chatListWindow: UIElement,
+        fallbackWindow: UIElement
+    ) -> UIElement? {
         runner.log("chat_id: scanning chat list rows")
         standardizeReadableWindow(chatListWindow, label: "chat list window")
         let scanner = ChatListScanner()
-        let snapshots = scanner.scan(in: chatListWindow, limit: 200, trace: { message in
-            runner.log(message)
-        })
+        let registry = ChatIdentityRegistryStore.shared
+        // Only rows carrying this chat's name can be it; reading every row's preview first
+        // outlasts the caller's time budget. With several chats of the same name on record
+        // all of them are needed to tell them apart, so only a unique name stops at its row.
+        let sameNameRecords = registry.recordCount(normalizedName: normalizedName)
+        let snapshots = scanner.scan(
+            in: chatListWindow,
+            limit: 200,
+            onlyNormalizedTitle: normalizedName,
+            stopAfter: sameNameRecords == 1 ? 1 : nil,
+            trace: { message in
+                runner.log(message)
+            }
+        )
         guard !snapshots.isEmpty else {
-            runner.log("chat_id: chat list scan returned no rows")
+            runner.log("chat_id: chat list scan found no row named like \(chatID)")
             return nil
         }
 
-        let registry = ChatIdentityRegistryStore.shared
         let assignedIDs = registry.assignChatIDs(for: snapshots.map(\.discovery))
         guard let matchIndex = assignedIDs.firstIndex(of: chatID) else {
             runner.log("chat_id: no visible chat row matched \(chatID)")

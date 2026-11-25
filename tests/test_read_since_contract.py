@@ -59,6 +59,38 @@ class ReadSinceContractTests(unittest.TestCase):
         self.assertIn('case oldestReached = "oldest_reached"', source)
         self.assertIn("case truncated", source)
         self.assertIn('case pagesLoaded = "pages_loaded"', source)
+        self.assertIn('case stopReason = "stop_reason"', source)
+
+    def test_since_read_names_why_it_stopped(self) -> None:
+        reader = TRANSCRIPT_READER.read_text(encoding="utf-8")
+
+        self.assertIn("enum TranscriptStopReason: String, Sendable, Encodable", reader)
+        for value in ('"page_cap"', '"scroll_failed"', '"rows_unreadable"', '"paging_unavailable"'):
+            self.assertIn(value, reader)
+        for case in ("case complete", "case deadline", "case limit"):
+            self.assertIn(case, reader)
+        self.assertIn("stopReason = limitHit ? .limit : .complete", reader)
+
+    def test_since_read_analyzes_rows_before_restoring_scroll(self) -> None:
+        reader = TRANSCRIPT_READER.read_text(encoding="utf-8")
+
+        # Back at the bottom KakaoTalk empties the oldest loaded rows, so paging must
+        # leave the transcript scrolled up and readSince restores it after the analysis.
+        load_history = reader.split("private func loadHistory(", 1)[1].split("private func scrollToBottom(", 1)[0]
+        self.assertNotIn("scrollToBottom(", load_history)
+        self.assertIn("outcome.scrolledBar = scrollBar", load_history)
+        read_since = reader.split("func readSince(", 1)[1].split("private func resolveOwnLabels(", 1)[0]
+        self.assertIn("scrollToBottom(scrolledBar)", read_since)
+        self.assertIn("emptyRowRun >= Self.emptyStretchMinRows, !rereadDone", read_since)
+        self.assertIn("emptyRowRun < Self.emptyStretchMinRows", read_since)
+
+    def test_chat_id_open_reads_only_rows_with_the_chat_name(self) -> None:
+        resolver = (SOURCES / "KakaoTalk" / "ChatWindowResolver.swift").read_text(encoding="utf-8")
+        scanner = CHAT_LIST_SCANNER.read_text(encoding="utf-8")
+
+        self.assertIn("onlyNormalizedTitle: normalizedName,", resolver)
+        self.assertIn("stopAfter: sameNameRecords == 1 ? 1 : nil,", resolver)
+        self.assertIn("ChatTextNormalizer.normalize(title) != onlyNormalizedTitle", scanner)
 
     def test_since_parser_accepts_iso_and_relative_spans(self) -> None:
         source = TRANSCRIPT_TIME.read_text(encoding="utf-8")
@@ -132,7 +164,7 @@ class MCPReadSinceContractTests(unittest.TestCase):
         self.assertIn("private static let sinceTimeoutDefault = 180.0", source)
         self.assertIn("private static let sinceTimeoutMax = 600.0", source)
         self.assertIn('command.append(contentsOf: ["--since", since, "--timeout-sec", String(Int(childBudget))])', source)
-        for key in ('meta["since"]', 'meta["oldest_reached"]', 'meta["truncated"]', 'meta["pages_loaded"]'):
+        for key in ('meta["since"]', 'meta["oldest_reached"]', 'meta["truncated"]', 'meta["pages_loaded"]', 'meta["stop_reason"]'):
             self.assertIn(key, source)
 
 
@@ -150,6 +182,7 @@ class ReadSinceDocumentationTests(unittest.TestCase):
         self.assertIn("`timeout_sec`", usage)
         self.assertIn("`oldest_reached`", usage)
         self.assertIn("`pages_loaded`", usage)
+        self.assertIn("`stop_reason`", usage)
         self.assertIn("`--max-pages N`", usage)
 
     def test_docs_list_mcp_chats_tool(self) -> None:
