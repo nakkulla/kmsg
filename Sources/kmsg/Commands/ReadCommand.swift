@@ -9,6 +9,8 @@ struct ReadCommand: ParsableCommand {
         let fetchedAt: String
         let count: Int
         let messages: [TranscriptMessage]
+        // Both modes; null when the newest end was not checked.
+        let newestReached: Bool?
         // Present only for --since reads.
         let since: String?
         let oldestReached: Bool?
@@ -21,17 +23,33 @@ struct ReadCommand: ParsableCommand {
             case fetchedAt = "fetched_at"
             case count
             case messages
+            case newestReached = "newest_reached"
             case since
             case oldestReached = "oldest_reached"
             case truncated
             case pagesLoaded = "pages_loaded"
             case stopReason = "stop_reason"
         }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(chat, forKey: .chat)
+            try container.encode(fetchedAt, forKey: .fetchedAt)
+            try container.encode(count, forKey: .count)
+            try container.encode(messages, forKey: .messages)
+            try container.encode(newestReached, forKey: .newestReached)
+            try container.encodeIfPresent(since, forKey: .since)
+            try container.encodeIfPresent(oldestReached, forKey: .oldestReached)
+            try container.encodeIfPresent(truncated, forKey: .truncated)
+            try container.encodeIfPresent(pagesLoaded, forKey: .pagesLoaded)
+            try container.encodeIfPresent(stopReason, forKey: .stopReason)
+        }
     }
 
     static let defaultLimit = 20
     static let defaultSinceLimit = 2_000
     static let defaultSinceTimeoutSec = 180.0
+    static let defaultRecentTimeoutSec = 6.0
 
     static let configuration = CommandConfiguration(
         commandName: "read",
@@ -51,6 +69,11 @@ struct ReadCommand: ParsableCommand {
             stops at --timeout-sec; --limit then only caps the result (default 2000).
             With --background-safe, --since reads only already loaded rows.
 
+            Before reading, the chat is scrolled to the bottom until no newer rows load
+            (recent reads only when the window opened away from the bottom).
+            newest_reached in the JSON output says whether the
+            newest end was confirmed; recent reads stop at --timeout-sec (default 6).
+
             When author is "(me)", the message was sent by you.
             """
     )
@@ -67,11 +90,11 @@ struct ReadCommand: ParsableCommand {
     @Option(name: .long, help: "Read all messages at or after this time: ISO 8601 (2026-11-18T07:00:00+09:00, local time without offset) or relative (90m, 24h, 2d)")
     var since: String?
 
-    @Option(name: .long, help: "With --since, maximum number of older-history pages (~50 rows each) to load")
+    @Option(name: .long, help: "Maximum number of history pages (~50 rows each) to load: older pages with --since, and separately newer pages when scrolling to the newest end")
     var maxPages: Int = 40
 
-    @Option(name: .long, help: "With --since, overall time budget in seconds; returns truncated results when exceeded")
-    var timeoutSec: Double = ReadCommand.defaultSinceTimeoutSec
+    @Option(name: .long, help: "Overall time budget in seconds; returns what was read so far when exceeded (default 180 with --since, 6 otherwise)")
+    var timeoutSec: Double?
 
     @Flag(name: .long, help: "Show raw element info for debugging")
     var debug: Bool = false
@@ -113,7 +136,7 @@ struct ReadCommand: ParsableCommand {
         if maxPages < 0 {
             throw ValidationError("--max-pages must be 0 or greater.")
         }
-        if timeoutSec <= 0 {
+        if let timeoutSec, timeoutSec <= 0 {
             throw ValidationError("--timeout-sec must be greater than 0.")
         }
 
@@ -247,6 +270,8 @@ struct ReadCommand: ParsableCommand {
         chatWindowResolver.takeKeysWithoutActivation(window)
 
         let sinceDate = since.flatMap { SinceParser.parse($0, now: startedAt) }
+        let budgetSec = timeoutSec ?? (sinceDate != nil ? Self.defaultSinceTimeoutSec : Self.defaultRecentTimeoutSec)
+        let deadline = startedAt.addingTimeInterval(budgetSec)
         let snapshot: TranscriptSnapshot
         var history: TranscriptHistoryInfo?
         do {
@@ -257,7 +282,7 @@ struct ReadCommand: ParsableCommand {
                     since: sinceDate,
                     limit: limit ?? Self.defaultSinceLimit,
                     maxPages: maxPages,
-                    deadline: startedAt.addingTimeInterval(timeoutSec),
+                    deadline: deadline,
                     allowPaging: !backgroundSafe
                 )
                 snapshot = result.snapshot
@@ -266,7 +291,9 @@ struct ReadCommand: ParsableCommand {
                 snapshot = try transcriptReader.readSnapshot(
                     from: window,
                     fallbackChatTitle: window.title ?? requestedChat,
-                    limit: limit ?? Self.defaultLimit
+                    limit: limit ?? Self.defaultLimit,
+                    // background-safe never scrolls, so the newest end stays unchecked.
+                    newestEnd: backgroundSafe ? nil : NewestEndOptions(maxLoads: maxPages, deadline: deadline)
                 )
             }
         } catch TranscriptReadError.transcriptContextUnavailable {
@@ -291,9 +318,9 @@ struct ReadCommand: ParsableCommand {
         print("Reading messages from: \(snapshot.chat)\n")
         if let history {
             print("Messages since \(SinceParser.format(history.since)) (\(snapshot.count)):")
-            print("pages_loaded: \(history.pagesLoaded), oldest_reached: \(history.oldestReached), truncated: \(history.truncated), stop_reason: \(history.stopReason.rawValue)\n")
+            print("pages_loaded: \(history.pagesLoaded), oldest_reached: \(history.oldestReached), newest_reached: \(snapshot.newestReached.map { String($0) } ?? "null"), truncated: \(history.truncated), stop_reason: \(history.stopReason.rawValue)\n")
         } else {
-            print("Recent messages (\(snapshot.count)):\n")
+            print("Recent messages (\(snapshot.count)), newest_reached: \(snapshot.newestReached.map { String($0) } ?? "null"):\n")
         }
         for (index, message) in snapshot.messages.enumerated() {
             if debug {
@@ -317,6 +344,7 @@ struct ReadCommand: ParsableCommand {
             fetchedAt: formatter.string(from: snapshot.fetchedAt),
             count: snapshot.count,
             messages: snapshot.messages,
+            newestReached: snapshot.newestReached,
             since: history.map { SinceParser.format($0.since) },
             oldestReached: history?.oldestReached,
             truncated: history?.truncated,

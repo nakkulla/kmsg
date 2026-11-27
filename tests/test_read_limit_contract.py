@@ -18,7 +18,8 @@ class RecentReadTablePathContractTests(unittest.TestCase):
         table_path = source.index("let tableMessages = readRecentFromTable(")
         row_search = source.index("let messageRows = collectTranscriptRows(")
         self.assertLess(table_path, row_search)
-        self.assertIn("if let table = transcriptTable(in: context.transcriptRoot) {", source)
+        self.assertIn("let table = transcriptTable(in: context.transcriptRoot)", source)
+        self.assertIn("if let table {\n            let tableMessages = readRecentFromTable(", source)
         self.assertIn("falling back to row search", source)
 
     def test_table_path_stops_at_the_limit_and_an_author_anchor(self) -> None:

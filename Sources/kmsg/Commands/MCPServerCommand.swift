@@ -195,6 +195,12 @@ private final class KmsgMCPServer {
     private static let sinceTimeoutDefault = 180.0
     private static let sinceTimeoutMax = 600.0
 
+    /// A recent read returns what it has 2 s before the parent stops it (8 s, or 15 s with
+    /// deep recovery), leaving time to close the window and print JSON.
+    private static func recentReadChildTimeoutArgs(deepRecovery: Bool) -> [String] {
+        ["--timeout-sec", deepRecovery ? "13" : "6"]
+    }
+
     private let protocolVersion = "2024-11-05"
     private let runner = KmsgSubprocessRunner()
     private let deepRecoveryDefault: Bool
@@ -320,7 +326,7 @@ private final class KmsgMCPServer {
         [
             [
                 "name": "kmsg_read",
-                "description": "Read recent KakaoTalk messages from a chat via kmsg, or every message since a time with since. With since, meta.truncated tells whether the range is incomplete and meta.stop_reason why (complete, page_cap, deadline, limit, scroll_failed, rows_unreadable, paging_unavailable).",
+                "description": "Read recent KakaoTalk messages from a chat via kmsg, or every message since a time with since. With since, meta.truncated tells whether the range is incomplete and meta.stop_reason why (complete, page_cap, deadline, limit, newest_unreached, scroll_failed, rows_unreadable, paging_unavailable). In both modes meta.newest_reached tells whether the newest messages were confirmed loaded (null when not checked).",
                 "inputSchema": [
                     "type": "object",
                     "properties": [
@@ -609,7 +615,10 @@ private final class KmsgMCPServer {
         if traceAX { command.append("--trace-ax") }
 
         let timeoutSec = sinceMode ? boundedSinceTimeoutSec : (deepRecovery ? 15.0 : 8.0)
-        var first = runner.run(command, timeoutSec: timeoutSec)
+        var first = runner.run(
+            command + (sinceMode ? [] : Self.recentReadChildTimeoutArgs(deepRecovery: deepRecovery)),
+            timeoutSec: timeoutSec
+        )
 
         if first.timedOut {
             return errorPayload(
@@ -630,6 +639,9 @@ private final class KmsgMCPServer {
             if code == "CHAT_NOT_FOUND" && !deepRecovery && !backgroundSafe {
                 var retryCommand = command
                 retryCommand.append("--deep-recovery")
+                if !sinceMode {
+                    retryCommand.append(contentsOf: Self.recentReadChildTimeoutArgs(deepRecovery: true))
+                }
                 let retry = runner.run(retryCommand, timeoutSec: sinceMode ? boundedSinceTimeoutSec : 15.0)
                 if retry.returncode == 0 && !retry.timedOut {
                     first = retry
@@ -677,6 +689,7 @@ private final class KmsgMCPServer {
                 "latency_ms": first.latencyMs,
                 "layout": layout,
                 "background_safe": backgroundSafe,
+                "newest_reached": payload["newest_reached"] ?? NSNull(),
             ],
         ]
         if sinceMode {

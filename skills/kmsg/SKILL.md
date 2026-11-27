@@ -78,6 +78,11 @@ kmsg read --chat-id "<chat_id>" --limit 20 --json
 Adjust `--limit` to the request. Summarize by default; include raw message
 content only when the user asks for it.
 
+Check `newest_reached` in the result. kmsg scrolls a chat that opened at the
+"여기까지 읽었습니다" marker down to its newest messages before reading; when
+`newest_reached` is `false` or `null`, say that the newest messages may be
+missing. A latest-N read stops after `--timeout-sec` (default 6 seconds).
+
 When the user asks for everything since a time ("since this morning", "last
 24 hours"), read by time instead of count:
 
@@ -88,8 +93,9 @@ kmsg read --chat-id "<chat_id>" --since 2026-11-18T07:00:00+09:00 --json
 
 `--since` loads older history and returns every message at or after that time
 (ISO 8601, or relative `90m`, `24h`, `2d`); `--limit` is only a safety cap
-there. Check `truncated` in the result: when `true`, say that the oldest part of
-the range is missing. Long ranges can take minutes; raise `--timeout-sec` if
+there. Check `truncated` in the result: when `true`, say that part of the range
+is missing: the oldest part, or the newest part when `stop_reason` is
+`newest_unreached` (`newest_reached` is not `true`). Long ranges can take minutes; raise `--timeout-sec` if
 needed. Add `--layout offscreen` so the KakaoTalk windows stay off screen and
 KakaoTalk stays in the background instead of covering the user's work;
 `kmsg send` takes the same option.
