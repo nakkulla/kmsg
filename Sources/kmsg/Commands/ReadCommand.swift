@@ -293,7 +293,7 @@ struct ReadCommand: ParsableCommand {
                     fallbackChatTitle: window.title ?? requestedChat,
                     limit: limit ?? Self.defaultLimit,
                     // background-safe never scrolls, so the newest end stays unchecked.
-                    newestEnd: backgroundSafe ? nil : NewestEndOptions(maxLoads: maxPages, deadline: deadline)
+                    newestEnd: NewestEndOptions(maxLoads: maxPages, deadline: deadline, scrollAllowed: !backgroundSafe)
                 )
             }
         } catch TranscriptReadError.transcriptContextUnavailable {

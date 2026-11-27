@@ -94,9 +94,11 @@ kmsg read --chat-id "<chat_id>" --since 2026-11-18T07:00:00+09:00 --json
 `--since` loads older history and returns every message at or after that time
 (ISO 8601, or relative `90m`, `24h`, `2d`); `--limit` is only a safety cap
 there. Check `truncated` in the result: when `true`, say that part of the range
-is missing: the oldest part, or the newest part when `stop_reason` is
-`newest_unreached` (`newest_reached` is not `true`). Long ranges can take minutes; raise `--timeout-sec` if
-needed. Add `--layout offscreen` so the KakaoTalk windows stay off screen and
+is missing. `stop_reason` only says why the read stopped (`deadline`,
+`page_cap`, `newest_unreached`, ...); judge missing newest messages separately
+from `newest_reached`: when it is not `true`, say the newest messages may be
+missing, whatever `stop_reason` is. Long ranges can take minutes; raise
+`--timeout-sec` if needed. Add `--layout offscreen` so the KakaoTalk windows stay off screen and
 KakaoTalk stays in the background instead of covering the user's work;
 `kmsg send` takes the same option.
 

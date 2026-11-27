@@ -170,9 +170,11 @@ struct KakaoTalkTranscriptReader {
         newestEnd: NewestEndOptions? = nil
     ) throws -> TranscriptSnapshot {
         let table = transcriptTable(in: context.transcriptRoot)
-        // Without options (watch, background-safe) the newest end is neither loaded nor judged.
+        // Without options (watch) there is no deadline and the newest end is not judged;
+        // background-safe keeps the deadline but never scrolls, so it stays unchecked.
+        let deadline = newestEnd?.deadline
         var newestOutcome: NewestEndOutcome?
-        if let newestEnd {
+        if let newestEnd, newestEnd.scrollAllowed {
             if let table {
                 newestOutcome = loadNewestEnd(
                     table: table,
@@ -188,37 +190,47 @@ struct KakaoTalkTranscriptReader {
         var newestAnalyzed: OwnTimeLabel?
         var analysisDeadlineHit = false
         var readMarkerSeen = false
+        let snapshot = { (messages: [TranscriptMessage]) -> TranscriptSnapshot in
+            TranscriptSnapshot(
+                chat: chatWindow.title ?? fallbackChatTitle,
+                fetchedAt: referenceDate,
+                messages: messages,
+                newestReached: newestEnd == nil ? nil : self.judgeNewestReached(
+                    newestOutcome,
+                    analyzedNewest: newestAnalyzed,
+                    analysisDeadlineHit: analysisDeadlineHit,
+                    readMarkerSeen: readMarkerSeen,
+                    notCheckedReason: newestEnd?.scrollAllowed == false ? "background_safe" : "no_table"
+                )
+            )
+        }
+        let deadlinePassed = { deadline.map { Date() >= $0 } ?? false }
 
         // The transcript table gives the rows directly; collecting them by search and
         // analyzing every one of them is the slow path kept for a window without a table.
+        var tableMessages: [TranscriptMessage] = []
         if let table {
-            let tableMessages = readRecentFromTable(
+            tableMessages = readRecentFromTable(
                 table,
                 context: context,
                 limit: limit,
                 includeSystemMessages: includeSystemMessages,
                 referenceDate: referenceDate,
-                deadline: newestEnd?.deadline,
+                deadline: deadline,
                 newestAnalyzed: &newestAnalyzed,
                 readMarkerSeen: &readMarkerSeen,
                 deadlineHit: &analysisDeadlineHit
             )
-            // Past the deadline the row search, which has no deadline, would only run longer;
-            // return what was read, even nothing.
+            // Past the deadline the row search would only run longer; return what was read, even nothing.
             if tableMessages.count >= min(limit, Self.minimumTableMessages(limit: limit)) || analysisDeadlineHit {
-                return TranscriptSnapshot(
-                    chat: chatWindow.title ?? fallbackChatTitle,
-                    fetchedAt: referenceDate,
-                    messages: tableMessages,
-                    newestReached: newestEnd == nil ? nil : judgeNewestReached(
-                        newestOutcome,
-                        analyzedNewest: newestAnalyzed,
-                        analysisDeadlineHit: analysisDeadlineHit,
-                        readMarkerSeen: readMarkerSeen
-                    )
-                )
+                return snapshot(tableMessages)
             }
             runner.log("read: table path gave \(tableMessages.count) message(s); falling back to row search")
+        }
+        if deadlinePassed() {
+            runner.log("read: time budget used up before the row search")
+            analysisDeadlineHit = true
+            return snapshot(tableMessages)
         }
 
         let frameCache = FrameCache()
@@ -239,24 +251,16 @@ struct KakaoTalkTranscriptReader {
             includeSystemMessages: includeSystemMessages,
             referenceDate: referenceDate,
             frameCache: frameCache,
+            deadline: deadline,
             newestAnalyzed: &newestAnalyzed,
-            readMarkerSeen: &readMarkerSeen
+            readMarkerSeen: &readMarkerSeen,
+            deadlineHit: &analysisDeadlineHit
         )
-        guard !displayMessages.isEmpty else {
+        guard !displayMessages.isEmpty || analysisDeadlineHit else {
             throw TranscriptReadError.noReadableMessages
         }
 
-        return TranscriptSnapshot(
-            chat: chatWindow.title ?? fallbackChatTitle,
-            fetchedAt: referenceDate,
-            messages: displayMessages,
-            newestReached: newestEnd == nil ? nil : judgeNewestReached(
-                newestOutcome,
-                analyzedNewest: newestAnalyzed,
-                analysisDeadlineHit: analysisDeadlineHit,
-                readMarkerSeen: readMarkerSeen
-            )
-        )
+        return snapshot(displayMessages)
     }
 
     private func collectTranscriptRows(
@@ -326,15 +330,27 @@ struct KakaoTalkTranscriptReader {
         includeSystemMessages: Bool,
         referenceDate: Date,
         frameCache: FrameCache,
+        deadline: Date? = nil,
         newestAnalyzed: inout OwnTimeLabel?,
-        readMarkerSeen: inout Bool
+        readMarkerSeen: inout Bool,
+        deadlineHit: inout Bool
     ) -> [TranscriptMessage] {
         let analysisBudget = max(limit * 5, 60)
         let rowsToAnalyze = Array(rows.suffix(analysisBudget))
-        let analyses = rowsToAnalyze.map {
-            analyzeRow($0, transcriptRoot: transcriptRoot, referenceDate: referenceDate, frameCache: frameCache)
+        // Newest first, so a deadline cuts only the oldest rows.
+        var reversedAnalyses: [RowAnalysis] = []
+        for row in rowsToAnalyze.reversed() {
+            if let deadline, Date() >= deadline {
+                runner.log("read: time budget used up after \(reversedAnalyses.count) searched row(s)")
+                deadlineHit = true
+                break
+            }
+            reversedAnalyses.append(
+                analyzeRow(row, transcriptRoot: transcriptRoot, referenceDate: referenceDate, frameCache: frameCache)
+            )
         }
-        newestAnalyzed = Self.newestOwnLabel(newestFirst: analyses.reversed())
+        let analyses = Array(reversedAnalyses.reversed())
+        newestAnalyzed = Self.newestOwnLabel(newestFirst: reversedAnalyses)
         readMarkerSeen = readMarkerSeen || Self.containsReadMarker(analyses)
 
         var messages = buildMessages(
@@ -346,7 +362,12 @@ struct KakaoTalkTranscriptReader {
 
         runner.log("read: row parser messages=\(messages.count)")
 
-        if messages.isEmpty || messages.count < max(3, min(limit / 2, 8)) {
+        let needsFallback = messages.isEmpty || messages.count < max(3, min(limit / 2, 8))
+        if needsFallback, !deadlineHit, let deadline, Date() >= deadline {
+            runner.log("read: time budget used up; skipping the text area fallback")
+            deadlineHit = true
+        }
+        if needsFallback, !deadlineHit {
             let fallback = extractFallbackMessages(from: transcriptRoot, limit: limit, referenceDate: referenceDate)
             runner.log("read: fallback messages=\(fallback.count)")
             messages.append(contentsOf: fallback)
@@ -1330,12 +1351,15 @@ private struct HistoryLoadOutcome {
     var scrolledBar: UIElement?
 }
 
-/// How a recent-N read loads and judges the newest end of the conversation.
+/// How a recent-N read bounds its time and loads and judges the newest end of the conversation.
 struct NewestEndOptions: Sendable {
     /// Cap on downward loads, separate from the older-history pages.
     let maxLoads: Int
     /// End of the whole read; loading stops earlier to leave time for reading rows.
     let deadline: Date
+    /// False in background-safe mode: the deadline still applies, but nothing is scrolled
+    /// and the newest end stays unchecked.
+    let scrollAllowed: Bool
 }
 
 private struct OwnTimeLabel: Equatable {
@@ -1353,8 +1377,10 @@ private enum NewestEndStop: String {
     case noScrollBar = "no_scroll_bar"
     /// A recent-N read whose initial table showed no sign of unloaded newer rows.
     case notSuspect = "not_suspect"
-    /// No scroll area or readable row count.
+    /// No scroll area, readable scroll bar, or readable row count.
     case unavailable
+    /// The confirm wait never read the row count, so "no change" is unconfirmed.
+    case rowCountUnreadable = "row_count_unreadable"
 }
 
 private struct NewestEndOutcome {
@@ -1837,12 +1863,22 @@ extension KakaoTalkTranscriptReader {
             runner.log("read-newest: transcript scroll area unavailable")
             return outcome
         }
-        guard let scrollBarElement: AXUIElement = scrollArea.attributeOptional(kAXVerticalScrollBarAttribute) else {
+        // Only a reported absence means the whole conversation fits; a timeout or another
+        // read error must not pass for "nothing below to load".
+        var scrollBarValue: CFTypeRef?
+        let scrollBarError = AXUIElementCopyAttributeValue(
+            scrollArea.axElement, kAXVerticalScrollBarAttribute as CFString, &scrollBarValue
+        )
+        if scrollBarError == .noValue || scrollBarError == .attributeUnsupported {
             runner.log("read-newest: no vertical scroll bar; nothing below to load")
             outcome.stop = .noScrollBar
             return outcome
         }
-        let scrollBar = UIElement(scrollBarElement)
+        guard scrollBarError == .success, let scrollBarValue, CFGetTypeID(scrollBarValue) == AXUIElementGetTypeID() else {
+            runner.log("read-newest: vertical scroll bar unreadable (\(scrollBarError.rawValue)); newest end not checked")
+            return outcome
+        }
+        let scrollBar = UIElement(scrollBarValue as! AXUIElement)
         guard var rowCount = rowCount(of: table), rowCount > 0 else {
             runner.log("read-newest: row count unavailable; newest end not checked")
             return outcome
@@ -1869,7 +1905,11 @@ extension KakaoTalkTranscriptReader {
         let stageStarted = Date()
         var label = peekNewestOwnLabel(in: table)
         var step = 0
-        while true {
+        if maxLoads <= 0 {
+            runner.log("read-newest: --max-pages 0; not scrolling down")
+            outcome.stop = .pageCap
+        }
+        while maxLoads > 0 {
             if Date() >= deadline {
                 runner.log("read-newest: time budget used up after \(outcome.loads) load(s)")
                 outcome.stop = .deadline
@@ -1896,10 +1936,12 @@ extension KakaoTalkTranscriptReader {
             var observedCount: Int?
             var observedLabel: OwnTimeLabel?
             var changed = false
+            var countReadable = false
             while Date() < waitUntil {
                 Thread.sleep(forTimeInterval: Self.pagePollInterval)
                 observedCount = self.rowCount(of: table)
                 observedLabel = peekNewestOwnLabel(in: table)
+                countReadable = countReadable || observedCount != nil
                 let countChanged = observedCount.map { $0 != rowCount } ?? false
                 let labelChanged = observedLabel.map { $0 != label } ?? false
                 if countChanged || labelChanged {
@@ -1912,8 +1954,13 @@ extension KakaoTalkTranscriptReader {
             )
 
             guard changed else {
-                // A wait cut short by the deadline says nothing about the newest end.
-                outcome.stop = waitClipped ? .deadline : .unchanged
+                // A wait cut short by the deadline, or one that never read the row count,
+                // says nothing about the newest end.
+                if waitClipped {
+                    outcome.stop = .deadline
+                } else {
+                    outcome.stop = countReadable ? .unchanged : .rowCountUnreadable
+                }
                 break
             }
             outcome.loads += 1
@@ -1956,7 +2003,7 @@ extension KakaoTalkTranscriptReader {
             case .notSuspect, .noScrollBar:
                 reached = true
                 reason = outcome.stop.rawValue
-            case .unavailable:
+            case .unavailable, .rowCountUnreadable:
                 reached = nil
                 reason = outcome.stop.rawValue
             case .deadline, .pageCap, .scrollFailed:
@@ -2043,11 +2090,27 @@ extension KakaoTalkTranscriptReader {
         return analyzedDate > recordedDate ? "analyzed_newer" : "analyzed_older"
     }
 
-    /// KakaoTalk's read marker row ("여기까지 읽었습니다") among already analyzed rows.
+    /// KakaoTalk's read marker row ("여기까지 읽었습니다") among already analyzed rows. The whole
+    /// body must be the marker, so a message that quotes it does not count. `isSystemLikeRow`
+    /// cannot tell it apart (it marks only date separators and attachments), and a message
+    /// carries its own time label where the marker row has none.
     private static func containsReadMarker(_ analyses: [RowAnalysis]) -> Bool {
         analyses.contains { analysis in
-            analysis.bodyCandidate.map { $0.body.filter { !$0.isWhitespace }.contains(readMarkerText) } ?? false
+            guard analysis.isSystemLikeRow || analysis.labelTime == nil,
+                  let body = analysis.bodyCandidate?.body
+            else {
+                return false
+            }
+            return isReadMarkerBody(body)
         }
+    }
+
+    private static func isReadMarkerBody(_ body: String) -> Bool {
+        var normalized = body.filter { !$0.isWhitespace }
+        while let last = normalized.last, last.isPunctuation {
+            normalized.removeLast()
+        }
+        return normalized == readMarkerText
     }
 
     private static func newestOwnLabel<S: Sequence>(newestFirst analyses: S) -> OwnTimeLabel? where S.Element == RowAnalysis {

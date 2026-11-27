@@ -15,11 +15,11 @@ class RecentReadTablePathContractTests(unittest.TestCase):
     def test_latest_read_takes_the_table_path_before_the_row_search(self) -> None:
         source = TRANSCRIPT_READER.read_text(encoding="utf-8")
 
-        table_path = source.index("let tableMessages = readRecentFromTable(")
+        table_path = source.index("tableMessages = readRecentFromTable(")
         row_search = source.index("let messageRows = collectTranscriptRows(")
         self.assertLess(table_path, row_search)
         self.assertIn("let table = transcriptTable(in: context.transcriptRoot)", source)
-        self.assertIn("if let table {\n            let tableMessages = readRecentFromTable(", source)
+        self.assertIn("if let table {\n            tableMessages = readRecentFromTable(", source)
         self.assertIn("falling back to row search", source)
 
     def test_table_path_stops_at_the_limit_and_an_author_anchor(self) -> None:
