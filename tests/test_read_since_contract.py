@@ -46,7 +46,9 @@ class ReadSinceContractTests(unittest.TestCase):
 
         self.assertIn("var since: String?", source)
         self.assertIn("var maxPages: Int = 40", source)
-        self.assertIn("var timeoutSec: Double = ReadCommand.defaultSinceTimeoutSec", source)
+        self.assertIn("var timeoutSec: Double?", source)
+        self.assertIn("let budgetSec = timeoutSec ?? (sinceDate != nil ? Self.defaultSinceTimeoutSec : Self.defaultRecentTimeoutSec)", source)
+        self.assertIn("static let defaultRecentTimeoutSec = 6.0", source)
         self.assertIn("static let defaultLimit = 20", source)
         self.assertIn("static let defaultSinceLimit = 2_000", source)
         self.assertIn("static let defaultSinceTimeoutSec = 180.0", source)
@@ -61,6 +63,20 @@ class ReadSinceContractTests(unittest.TestCase):
         self.assertIn('case pagesLoaded = "pages_loaded"', source)
         self.assertIn('case stopReason = "stop_reason"', source)
 
+    def test_read_json_reports_newest_reached_in_both_modes(self) -> None:
+        source = READ_COMMAND.read_text(encoding="utf-8")
+
+        self.assertIn('case newestReached = "newest_reached"', source)
+        # Explicit null (not an absent key) when the newest end was not checked.
+        self.assertIn("try container.encode(newestReached, forKey: .newestReached)", source)
+        self.assertIn("newestReached: snapshot.newestReached,", source)
+        # background-safe keeps the deadline but does not scroll.
+        self.assertIn(
+            "newestEnd: NewestEndOptions(maxLoads: maxPages, deadline: deadline, scrollAllowed: !backgroundSafe)",
+            source,
+        )
+        self.assertIn("if let timeoutSec, timeoutSec <= 0 {", source)
+
     def test_since_read_names_why_it_stopped(self) -> None:
         reader = TRANSCRIPT_READER.read_text(encoding="utf-8")
 
@@ -70,6 +86,110 @@ class ReadSinceContractTests(unittest.TestCase):
         for case in ("case complete", "case deadline", "case limit"):
             self.assertIn(case, reader)
         self.assertIn("stopReason = limitHit ? .limit : .complete", reader)
+
+    def test_since_read_reports_newest_unreached_after_incomplete_reasons(self) -> None:
+        reader = TRANSCRIPT_READER.read_text(encoding="utf-8")
+        read_since = reader.split("func readSince(", 1)[1].split("private func resolveOwnLabels(", 1)[0]
+
+        self.assertIn('case newestUnreached = "newest_unreached"', reader)
+        self.assertIn("let truncated = limitHit || !covered || newestReached != true", read_since)
+        # Uncovered-range reasons win, then newest_unreached, then limit, then complete.
+        chain = read_since[read_since.index("let stopReason: TranscriptStopReason"):]
+        newest = chain.index("if covered, newestReached != true {\n            stopReason = .newestUnreached")
+        limit = chain.index("} else if covered {\n            stopReason = limitHit ? .limit : .complete")
+        deadline = chain.index("} else if deadlineHit {\n            stopReason = .deadline")
+        self.assertLess(newest, limit)
+        self.assertLess(limit, deadline)
+        # complete only when truncated is false.
+        self.assertIn("/// Why the read ended; `.complete` exactly when `truncated` is false.", reader)
+
+    def test_reads_load_the_newest_end_before_reading_rows(self) -> None:
+        reader = TRANSCRIPT_READER.read_text(encoding="utf-8")
+        read_since = reader.split("func readSince(", 1)[1].split("private func resolveOwnLabels(", 1)[0]
+        stage = reader.split("private func loadNewestEnd(", 1)[1].split("private func judgeNewestReached(", 1)[0]
+
+        self.assertIn("NSNumber(value: 0.95)", stage)
+        self.assertIn("current >= 0.99", stage)
+        self.assertIn("let fullWaitEnd = Date().addingTimeInterval(Self.newestLoadTimeout)", stage)
+        self.assertIn("private static let newestLoadTimeout: TimeInterval = pageGrowthTimeout", reader)
+        self.assertIn("if outcome.loads >= maxLoads {", stage)
+        self.assertNotIn("pagesLoaded", stage)
+        self.assertIn('"read-newest: step \\(step) rows', stage)
+        # since: the stage takes its share of the paging budget before paging up.
+        self.assertLess(read_since.index("newestOutcome = loadNewestEnd("), read_since.index("outcome = loadHistory("))
+        self.assertIn("deadline: min(Date().addingTimeInterval(newestBudget), pagingDeadline)", read_since)
+        # recent-N: only when suspect, before both the table path and the row search.
+        snapshot = reader.split("referenceDate: Date = Date(),\n        newestEnd: NewestEndOptions? = nil", 1)[1]
+        snapshot = snapshot.split("private func collectTranscriptRows(", 1)[0]
+        self.assertLess(snapshot.index("onlyWhenSuspect: true"), snapshot.index("tableMessages = readRecentFromTable("))
+        self.assertIn('static let readMarkerText = "여기까지읽었습니다"', reader)
+        # The marker is looked for in analyzed rows only; a full-table scan cost ~5 s.
+        self.assertIn("readMarkerSeen = Self.containsReadMarker(reversedAnalyses)", reader)
+        self.assertIn("case .notSuspect where readMarkerSeen:", reader)
+        self.assertIn('reason = "read_marker_at_bottom"', reader)
+        self.assertNotIn("hasReadMarkerRow", reader)
+        # Past the recent-N deadline the table result stands.
+        self.assertIn("|| analysisDeadlineHit {", reader)
+
+    def test_recent_read_bounds_the_row_search_by_the_deadline(self) -> None:
+        reader = TRANSCRIPT_READER.read_text(encoding="utf-8")
+        snapshot = reader.split("referenceDate: Date = Date(),\n        newestEnd: NewestEndOptions? = nil", 1)[1]
+        snapshot = snapshot.split("private func collectTranscriptRows(", 1)[0]
+        extract = reader.split("private func extractMessages(", 1)[1].split("private func buildMessages(", 1)[0]
+
+        self.assertIn("let deadline = newestEnd?.deadline", snapshot)
+        self.assertIn("if let newestEnd, newestEnd.scrollAllowed {", snapshot)
+        self.assertIn('notCheckedReason: newestEnd?.scrollAllowed == false ? "background_safe" : "no_table"', snapshot)
+        # The row search is skipped once the deadline has passed, and cut short at it.
+        self.assertLess(snapshot.index("if deadlinePassed() {"), snapshot.index("let messageRows = collectTranscriptRows("))
+        self.assertIn("deadlineHit: &analysisDeadlineHit\n        )\n        guard !displayMessages.isEmpty || analysisDeadlineHit else {", snapshot)
+        self.assertIn("for row in rowsToAnalyze.reversed() {\n            if let deadline, Date() >= deadline {", extract)
+        self.assertIn("if needsFallback, !deadlineHit {", extract)
+        self.assertIn("let scrollAllowed: Bool", reader)
+
+    def test_newest_end_stage_trusts_only_readable_state(self) -> None:
+        reader = TRANSCRIPT_READER.read_text(encoding="utf-8")
+        stage = reader.split("private func loadNewestEnd(", 1)[1].split("private func judgeNewestReached(", 1)[0]
+        judge = reader.split("private func judgeNewestReached(", 1)[1].split("private func peekNewestOwnLabel(", 1)[0]
+
+        # A missing scroll bar is told from an unreadable one by the AX error.
+        self.assertNotIn("attributeOptional(kAXVerticalScrollBarAttribute)", stage)
+        self.assertIn("AXUIElementCopyAttributeValue(", stage)
+        self.assertIn("if scrollBarError == .noValue || scrollBarError == .attributeUnsupported {", stage)
+        self.assertIn("guard scrollBarError == .success, let scrollBarValue, CFGetTypeID(scrollBarValue) == AXUIElementGetTypeID() else {", stage)
+        # "No change" needs a readable row count during the wait.
+        self.assertIn("countReadable = countReadable || observedCount != nil", stage)
+        self.assertIn('case rowCountUnreadable = "row_count_unreadable"', reader)
+        self.assertIn("case .unavailable, .rowCountUnreadable:\n                reached = nil", judge)
+        # --max-pages 0 never scrolls down.
+        self.assertLess(stage.index("if maxLoads <= 0 {\n"), stage.index("while maxLoads > 0 {"))
+        self.assertLess(stage.index("while maxLoads > 0 {"), stage.index("NSNumber(value: 1.0)"))
+        # loadHistory keeps its own scroll bar handling.
+        load_history = reader.split("private func loadHistory(", 1)[1].split("private func scrollToBottom(", 1)[0]
+        self.assertIn("attributeOptional(kAXVerticalScrollBarAttribute)", load_history)
+
+    def test_read_marker_needs_the_whole_body_on_an_unlabelled_row(self) -> None:
+        reader = TRANSCRIPT_READER.read_text(encoding="utf-8")
+        marker = reader.split("private static func containsReadMarker(", 1)[1].split("private static func newestOwnLabel<", 1)[0]
+
+        self.assertIn("guard analysis.isSystemLikeRow || analysis.labelTime == nil,", marker)
+        self.assertIn("while let last = normalized.last, last.isPunctuation {", marker)
+        self.assertIn("return normalized == readMarkerText", marker)
+        self.assertNotIn(".contains(readMarkerText)", marker)
+
+    def test_newest_reached_compares_the_recorded_and_analyzed_labels(self) -> None:
+        reader = TRANSCRIPT_READER.read_text(encoding="utf-8")
+        judge = reader.split("private func judgeNewestReached(", 1)[1].split("private func peekNewestOwnLabel(", 1)[0]
+
+        self.assertIn("case .notSuspect, .noScrollBar:", judge)
+        self.assertIn("case .deadline, .pageCap, .scrollFailed:", judge)
+        self.assertIn("} else if outcome.lastLabel == nil {", judge)
+        self.assertIn("} else if let recorded = outcome.lastLabel, recorded != analyzedNewest,", judge)
+        self.assertIn('mismatch != "analyzed_newer"', judge)
+        self.assertIn("outcome.lastLabel = newestRowLabel(in: table, transcriptRoot: transcriptRoot)", reader)
+        self.assertIn("if waitClipped {\n                    outcome.stop = .deadline", reader)
+        self.assertIn("outcome.stop = countReadable ? .unchanged : .rowCountUnreadable", reader)
+        self.assertIn('"read-newest: newest_reached=', judge)
 
     def test_since_read_analyzes_rows_before_restoring_scroll(self) -> None:
         reader = TRANSCRIPT_READER.read_text(encoding="utf-8")
@@ -184,6 +304,23 @@ class ReadSinceDocumentationTests(unittest.TestCase):
         self.assertIn("`pages_loaded`", usage)
         self.assertIn("`stop_reason`", usage)
         self.assertIn("`--max-pages N`", usage)
+
+    def test_docs_describe_newest_reached(self) -> None:
+        usage = USAGE.read_text(encoding="utf-8")
+        skill = SKILL.read_text(encoding="utf-8")
+
+        for text in (usage, skill):
+            self.assertIn("`newest_reached`", text)
+            self.assertIn("`newest_unreached`", text)
+            self.assertIn("--timeout-sec", text)
+        self.assertIn("#### Reading the newest end", usage)
+        # stop_reason names one reason; missing newest messages are judged from newest_reached.
+        self.assertIn("judge missing newest messages separately\nfrom `newest_reached`", skill)
+        self.assertNotIn("the oldest part, or the newest part when `stop_reason`", skill)
+        self.assertIn("`stop_reason` names only the one reason the read stopped", usage)
+        self.assertNotIn("the returned messages are then the newest part of the\nrange", usage)
+        self.assertIn("`meta.newest_reached`", usage)
+        self.assertIn("It is `complete` exactly when `truncated`\nis `false`.", usage)
 
     def test_docs_list_mcp_chats_tool(self) -> None:
         for path in (README_KO, README_EN, USAGE, SKILL):

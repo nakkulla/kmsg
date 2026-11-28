@@ -210,8 +210,8 @@ A chat name and `--chat-id` are mutually exclusive.
 | `--chat-id ID` | Resolve a synthetic ID produced by `kmsg chats`. |
 | `-l N`, `--limit N` | Maximum messages to return. Default: `20`. With `--since`, a safety cap. Default: `2000`. |
 | `--since TIME` | Return every message at or after `TIME` instead of the latest `N`. Accepts ISO 8601 (`2026-11-18T07:00:00+09:00`; local time when no offset is given) or a relative span (`90m`, `24h`, `2d`). |
-| `--max-pages N` | With `--since`, load at most `N` pages (about 50 rows each) of older history. Default: `40`. |
-| `--timeout-sec N` | With `--since`, overall time budget in seconds. When it runs out, the newest messages read so far are returned with `truncated: true`. Default: `180`. |
+| `--max-pages N` | With `--since`, load at most `N` pages (about 50 rows each) of older history. The same cap applies separately to newer pages loaded while scrolling to the newest end. Default: `40`. |
+| `--timeout-sec N` | Overall time budget in seconds. With `--since`, when it runs out, the newest messages read so far are returned with `truncated: true`; default `180`. Without `--since`, when it runs out, the messages read so far are returned with `newest_reached: false` (`null` with `--background-safe`); default `6`. |
 | `--debug` | Show compact raw parsing information in text output. |
 | `--trace-ax` | Print AX traversal and retry details. |
 | `-k`, `--keep-window` | Keep a chat window opened by the command. |
@@ -256,12 +256,42 @@ checks the list after restoring the field, and again when a query it typed
 does not change the list, and closes the search with the main window's search
 button so the full chat list comes back.
 
+#### Reading the newest end
+
+KakaoTalk opens a chat with many unread messages at the "read up to here"
+marker (여기까지 읽었습니다) and loads only about 50 rows around it; newer rows
+load only as the transcript is scrolled to the bottom. Before reading, kmsg
+therefore sets the transcript's scroll position to the bottom (from just above
+it when it is already there), waits up to 3 seconds for the row count or the
+newest time label to change, and repeats until nothing changes. It also stops at
+the time budget, after `--max-pages` loads (with `--max-pages 0` it does not
+scroll at all), or when the scroll position cannot be set; these newer loads are
+not counted in `pages_loaded`.
+
+The JSON output reports the result as `newest_reached`:
+
+- `true`: the last step loaded nothing, the transcript sits at the bottom, and
+  the newest time-labelled row seen then is the newest time-labelled row the
+  read analyzed. A transcript without a vertical scroll bar (the whole
+  conversation fits) is `true` too.
+- `false`: loading stopped at the time budget, `--max-pages`, or a scroll
+  failure, or the newest row seen at the bottom is not among the analyzed rows.
+- `null`: not checked, because of `--background-safe` or because the transcript
+  table, its vertical scroll bar (a read error, not a missing bar), its row count
+  (also while waiting for a load), or its scroll position could not be read.
+
+`--since` reads always run this step first, within half of the paging share of
+`--timeout-sec` (at least one full 3-second wait when the share allows it), so
+paging older history keeps the rest. Reads of the latest `N` run it only when the
+opened transcript is not at the bottom; otherwise they report `true` without
+scrolling, or `false` when one of the analyzed rows is the read marker.
+
 #### Reading since a time
 
 `--since` scrolls the chat transcript to the top repeatedly so KakaoTalk loads
 older messages (about 50 rows per page), until the oldest loaded message is
 older than `TIME`, the conversation start is reached, `--max-pages` is hit, or
-half of `--timeout-sec` is used. It then scrolls back to the bottom and reads
+the paging share (half of `--timeout-sec`, after the newest-end step) is used. It then scrolls back to the bottom and reads
 from the newest message backwards, stopping once two consecutive time-labelled
 messages are older than `TIME`. Only a message's own time label (the time text
 whose tooltip carries the date) decides this, so quoted or forwarded content
@@ -280,7 +310,10 @@ one are in hand. `date` and `time_raw` follow the `--since` rule above: a messag
 own time label, or the nearest newer label for a bubble without one. A message
 therefore carries the same time in both reads. A window without a transcript table,
 or one that yields too few messages this way, is read by searching for its rows as
-before.
+before. Both paths read the rows after the newest-end step above, newest first, and
+the whole read stops at `--timeout-sec` (default 6 seconds, `--background-safe`
+included): past it the row search is skipped or cut short, and the messages read so
+far are returned. Finding the chat window and its transcript is not bounded by it.
 
 #### If `--background-safe` is missing
 
@@ -434,13 +467,16 @@ The server exposes:
 | `kmsg_send_image` | Send a local image by chat name. |
 
 `kmsg_read` limits: without `since`, `limit` is clamped to `1..100` (default
-`20`) and the read process times out after 8 seconds (15 with deep recovery).
+`20`) and the read process times out after 8 seconds (15 with deep recovery);
+the read itself gets `--timeout-sec 6` (`13` with deep recovery) so it returns what
+it read before that.
 A process that runs over its time limit gets a stop signal and up to 2 seconds to
 put a moved window back and close the chat window it opened, before it is killed.
 With `since`, `limit` is a safety cap clamped to `1..2000` (default `2000`), and
 `timeout_sec` (default `180`, range `10..600`) sets the process time limit. The
 result `meta` then also carries `since`, `oldest_reached`, `truncated`,
-`pages_loaded`, and `stop_reason`.
+`pages_loaded`, and `stop_reason`. In both modes `meta.newest_reached` carries the
+read's `newest_reached` (`null` when it was not checked).
 
 `kmsg_chats` runs `kmsg chats --json` with a 20 second process time limit and
 returns `{ok, count, chats, meta: {latency_ms}}`. Each chat carries `title`,
@@ -508,6 +544,7 @@ kmsg read "홍길동" --limit 20 --json
   "chat": "홍길동",
   "fetched_at": "2026-02-26T01:23:45.678Z",
   "count": 1,
+  "newest_reached": true,
   "messages": [
     {
       "author": "홍길동",
@@ -525,7 +562,8 @@ kmsg read "홍길동" --limit 20 --json
 ```
 
 `date` and `time_raw` may be absent when KakaoTalk does not expose the
-corresponding metadata.
+corresponding metadata. `newest_reached` (`true`, `false`, or `null`) tells whether
+the newest messages were confirmed loaded; see "Reading the newest end".
 
 `image_count` counts the images shown with a message's text. It is the same
 wherever the transcript is scrolled, and a text message's bubble background is
@@ -544,6 +582,7 @@ kmsg read --chat-id "chat_7f42c5e1d9ab" --since 2026-11-18T07:00:00+09:00 --json
   "fetched_at": "2026-11-19T01:23:45.678Z",
   "count": 42,
   "messages": ["..."],
+  "newest_reached": true,
   "since": "2026-11-18T07:00:00+09:00",
   "oldest_reached": false,
   "truncated": false,
@@ -555,16 +594,23 @@ kmsg read --chat-id "chat_7f42c5e1d9ab" --since 2026-11-18T07:00:00+09:00 --json
 `oldest_reached` is `true` when paging reached the start of the conversation.
 `truncated` is `true` when the read stopped at `--max-pages`, `--timeout-sec`,
 or `--limit` before covering `since`, or when `--background-safe` prevented
-loading older history; the returned messages are then the newest part of the
-range. An empty range returns `count: 0`.
+loading older history; the oldest part of the range is then missing. It is also `true` whenever `newest_reached` is not `true` (`false` or
+`null`), so a `--background-safe` `--since` read is always truncated. An empty
+range returns `count: 0`.
 
 `stop_reason` says why the read ended: `complete` (the range back to `since` is
 covered), `page_cap` (`--max-pages`), `deadline` (`--timeout-sec`), `limit`
-(`--limit` dropped older messages), `scroll_failed` (the transcript could not be
-scrolled up), `rows_unreadable` (rows reaching back to `since` were loaded but
+(`--limit` dropped older messages), `newest_unreached` (the range back to `since`
+is covered but `newest_reached` is not `true`), `scroll_failed` (the transcript
+could not be scrolled up), `rows_unreadable` (rows reaching back to `since` were loaded but
 KakaoTalk exposed no content for them, even after one re-read; retrying usually
 helps), or `paging_unavailable` (`--background-safe`, or no scrollable
-transcript). It is `complete` exactly when `truncated` is `false`.
+transcript). When several apply, the reasons for an uncovered range (`deadline`,
+`page_cap`, `scroll_failed`, `rows_unreadable`, `paging_unavailable`) come first,
+then `newest_unreached`, then `limit`. It is `complete` exactly when `truncated`
+is `false`. `stop_reason` names only the one reason the read stopped, so a
+`deadline` or `page_cap` read may also miss the newest messages: judge that
+separately from `newest_reached`, which is not `true` whenever they may be missing.
 
 ### Watch
 

@@ -70,6 +70,34 @@ class MCPServerContractTests(unittest.TestCase):
         for code in ('"PROCESS_TIMEOUT"', '"INVALID_JSON_OUTPUT"', '"INVALID_ARGUMENT"'):
             self.assertIn(code, body)
 
+    def test_read_forwards_newest_reached_in_both_modes(self) -> None:
+        source = MCP_SERVER_COMMAND.read_text(encoding="utf-8")
+        start = source.index("private func callKmsgRead(")
+        end = source.index("private func callKmsgChats(", start)
+        body = source[start:end]
+
+        # Set in the base meta, before the since-only fields.
+        forward = body.index('"newest_reached": payload["newest_reached"] ?? NSNull(),')
+        self.assertLess(forward, body.index("if sinceMode {\n            var meta"))
+
+    def test_recent_read_child_gets_a_timeout_inside_the_process_limit(self) -> None:
+        source = MCP_SERVER_COMMAND.read_text(encoding="utf-8")
+
+        self.assertIn('["--timeout-sec", deepRecovery ? "13" : "6"]', source)
+        self.assertIn(
+            "command + (sinceMode ? [] : Self.recentReadChildTimeoutArgs(deepRecovery: deepRecovery)),",
+            source,
+        )
+        self.assertIn("retryCommand.append(contentsOf: Self.recentReadChildTimeoutArgs(deepRecovery: true))", source)
+
+    def test_read_tool_description_lists_newest_unreached(self) -> None:
+        source = MCP_SERVER_COMMAND.read_text(encoding="utf-8")
+        start = source.index('"name": "kmsg_read"')
+        description = source[start: source.index('"inputSchema"', start)]
+
+        self.assertIn("limit, newest_unreached, scroll_failed", description)
+        self.assertIn("meta.newest_reached", description)
+
 
 if __name__ == "__main__":
     unittest.main()
